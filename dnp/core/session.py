@@ -94,7 +94,7 @@ class SessionGraph:
     # Visualisation
     # ------------------------------------------------------------------
 
-    def show_graph(self, title="Graphe de Calcul (Passe Avant)"):
+    def show_graph(self, title="Graphe de Calcul (Passe Avant)", save=False, filename="computation_graph.png"):
         """Render the current computation graph with matplotlib."""
         if plt is None:
             print("⚠️ Matplotlib n'est pas installé. Visualisation impossible.")
@@ -121,7 +121,16 @@ class SessionGraph:
         )
         plt.title(title)
         plt.axis("off")
-        plt.show()
+        
+        if save:
+            plt.savefig(filename, bbox_inches="tight", dpi=150)
+            print(f"✅ Graphe sauvegardé sous : {filename}")
+        else:
+            plt.show()
+        plt.close()
+
+    # Alias for french/typo
+    show_graphe = show_graph
 
 
 # ---------------------------------------------------------------------------

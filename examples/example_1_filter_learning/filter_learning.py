@@ -129,6 +129,11 @@ def main():
         if (epoch + 1) % 50 == 0:
             print(f"  Epoch {epoch + 1:3d}/{epochs} | Loss: {loss.item():.6f}")
 
+        if epoch == 0:
+            out_path = Path(__file__).parent.parent.parent / "figures" / "example_1_filter_learning" / "computation_graph.png"
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            session.show_graphe(title="Filter Learning Graph", save=True, filename=str(out_path))
+
     session.reset()
     final_pred = convolve2d(X_img, W_learned.data, mode="valid")
 

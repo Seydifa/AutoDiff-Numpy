@@ -163,6 +163,11 @@ def main():
                 f"Test Loss: {test_loss.item():.6f}"
             )
 
+        if epoch == 0:
+            out_path = Path(__file__).parent.parent.parent / "figures" / "example_3_simple_regression" / "computation_graph.png"
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            session.show_graphe(title="Simple Regression Graph", save=True, filename=str(out_path))
+
     print("\n5. Training complete!")
     print(f"  Final train loss: {train_loss_history[-1]:.6f}")
     print(f"  Final test loss: {test_loss_history[-1]:.6f}")

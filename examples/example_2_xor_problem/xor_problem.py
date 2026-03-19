@@ -128,6 +128,11 @@ def main():
         if (epoch + 1) % 100 == 0:
             print(f"  Epoch {epoch + 1:3d}/{epochs} | Loss: {loss.item():.6f}")
 
+        if epoch == 0:
+            out_path = Path(__file__).parent.parent.parent / "figures" / "example_2_xor_problem" / "computation_graph.png"
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            session.show_graphe(title="XOR Problem Graph", save=True, filename=str(out_path))
+
     print("\n5. Training complete!")
     print(f"  Final loss: {loss_history[-1]:.6f}\n")
 

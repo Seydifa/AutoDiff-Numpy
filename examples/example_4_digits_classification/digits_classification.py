@@ -182,6 +182,11 @@ def main():
         avg_loss = np.mean(epoch_losses)
         train_loss_history.append(avg_loss)
         
+        if epoch == 0:
+            out_path = Path(__file__).parent.parent.parent / "figures" / "example_4_digits_classification" / "computation_graph.png"
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            session.show_graphe(title="Digits Classification Graph", save=True, filename=str(out_path))
+            
         # Evaluate on test set
         test_acc, _ = evaluate_accuracy(model, X_test, y_test)
         test_acc_history.append(test_acc)
