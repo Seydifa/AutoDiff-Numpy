@@ -468,7 +468,9 @@ class LayerNorm(Module):
         diff = ops.subtract(x, mean)
         sq_diff = ops.square(diff)
         var = ops.mean(sq_diff, axis=-1, keepdims=True)
-        std = ops.sqrt(ops.add(var, self.eps))
+        # Wrapping eps in a Tensor to prevent backwards arguments matching issue
+        eps_t = Tensor(np.array([self.eps], dtype=np.float32))
+        std = ops.sqrt(ops.add(var, eps_t))
         x_norm = ops.divide(diff, std)
         out = ops.multiply(x_norm, self.gamma)
         if self.use_bias:
@@ -533,17 +535,20 @@ class ScaledDotProductAttention(Module):
             output: (..., seq_len_q, d_v)
         """
         # Compute attention scores by transposing last 2 dims of key
-        query_np = np.asarray(query)
-        key_np = np.asarray(key)
-        value_np = np.asarray(value)
-
-        # Transpose last 2 dimensions: (..., seq_len_k, d_k) -> (..., d_k, seq_len_k)
-        key_transposed = np.swapaxes(key_np, -2, -1)
-        scores = matmul(query, Tensor(key_transposed))
-        scores = scores * self.scale
+        # Use ops.transpose to preserve the computational graph
+        ndim = len(np.asarray(key).shape)
+        axes = list(range(ndim))
+        axes[-1], axes[-2] = axes[-2], axes[-1]
+        key_transposed = ops.transpose(key, axes=tuple(axes))
+        
+        scores = matmul(query, key_transposed)
+        
+        scale_t = Tensor(np.array([self.scale], dtype=np.float32))
+        scores = ops.multiply(scores, scale_t)
 
         if mask is not None:
-            scores = scores + mask
+            # Mask must also be a Tensor
+            scores = ops.add(scores, mask)
 
         # Apply softmax
         attn_weights = softmax(scores)

@@ -296,7 +296,10 @@ VJP_RULES = {
     # ======================================================================
     # 3. MATRIX OPERATIONS
     # ======================================================================
-    np.matmul: lambda g, x, y: (np.matmul(g, y.T), np.matmul(x.T, g)),
+    np.matmul: lambda g, x, y: (
+        unbroadcast(np.matmul(g, np.swapaxes(y, -1, -2) if getattr(y, 'ndim', 0) >= 2 else y), x.shape),
+        unbroadcast(np.matmul(np.swapaxes(x, -1, -2) if getattr(x, 'ndim', 0) >= 2 else x, g), y.shape),
+    ),
     np.dot: lambda g, x, y: (np.dot(g, y.T), np.dot(x.T, g)),
     # ======================================================================
     # 4. REDUCTIONS  (axis + keepdims aware)
