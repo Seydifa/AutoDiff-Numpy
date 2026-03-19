@@ -23,6 +23,7 @@ import numpy as np
 
 # Local imports: Core tensor and operations
 from .tensor import Tensor
+from . import ops
 from .ops import (
     matmul,
     add,
@@ -451,6 +452,43 @@ class BatchNorm2d(Module):
         )
 
 
+class LayerNorm(Module):
+    """Layer normalization."""
+    def __init__(self, ndim, bias=True, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+        self.gamma = Tensor(np.ones(ndim), name="LN_gamma")
+        self.use_bias = bias
+        if bias:
+            self.beta = Tensor(np.zeros(ndim), name="LN_beta")
+
+    def forward(self, x: Tensor) -> Tensor:
+        # Calculate mean along last axis
+        mean = ops.mean(x, axis=-1, keepdims=True)
+        diff = ops.subtract(x, mean)
+        sq_diff = ops.square(diff)
+        var = ops.mean(sq_diff, axis=-1, keepdims=True)
+        std = ops.sqrt(ops.add(var, self.eps))
+        x_norm = ops.divide(diff, std)
+        out = ops.multiply(x_norm, self.gamma)
+        if self.use_bias:
+            out = ops.add(out, self.beta)
+        return out
+
+
+class Embedding(Module):
+    """Embedding layer constructed with one-hot encoding for autograd compatibility."""
+    def __init__(self, num_embeddings, embedding_dim, name="Embedding"):
+        super().__init__()
+        self.lin = Linear(num_embeddings, embedding_dim, bias=False, name=name)
+        self.num_embeddings = num_embeddings
+        
+    def forward(self, x_idx):
+        x_idx_np = np.asarray(x_idx) if hasattr(x_idx, 'data') else x_idx
+        one_hot = np.eye(self.num_embeddings)[x_idx_np]
+        return self.lin(Tensor(one_hot))
+
+
 # ============================================================================
 # REGULARIZATION LAYERS
 # ============================================================================
@@ -547,26 +585,24 @@ class MultiHeadAttention(Module):
         k = self.W_k(key)
         v = self.W_v(value)
 
-        # Reshape: (batch, seq_len, d_model) -> (batch, seq_len, num_heads, d_k)
-        q = Tensor(np.asarray(q).reshape(batch_size, seq_len, self.num_heads, self.d_k))
-        k = Tensor(np.asarray(k).reshape(batch_size, seq_len, self.num_heads, self.d_k))
-        v = Tensor(np.asarray(v).reshape(batch_size, seq_len, self.num_heads, self.d_k))
+        # Use ops.reshape and ops.transpose to keep gradients flowing
+        q = ops.reshape(q, newshape=(batch_size, seq_len, self.num_heads, self.d_k))
+        k = ops.reshape(k, newshape=(batch_size, seq_len, self.num_heads, self.d_k))
+        v = ops.reshape(v, newshape=(batch_size, seq_len, self.num_heads, self.d_k))
 
         # Transpose: (batch, seq_len, num_heads, d_k) -> (batch, num_heads, seq_len, d_k)
-        q = Tensor(np.transpose(np.asarray(q), (0, 2, 1, 3)))
-        k = Tensor(np.transpose(np.asarray(k), (0, 2, 1, 3)))
-        v = Tensor(np.transpose(np.asarray(v), (0, 2, 1, 3)))
+        q = ops.transpose(q, axes=(0, 2, 1, 3))
+        k = ops.transpose(k, axes=(0, 2, 1, 3))
+        v = ops.transpose(v, axes=(0, 2, 1, 3))
 
         # Apply attention (scaled independently for each head)
         attn_output = self.attention(q, k, v, mask)
 
         # Transpose back: (batch, num_heads, seq_len, d_k) -> (batch, seq_len, num_heads, d_k)
-        attn_output = Tensor(np.transpose(np.asarray(attn_output), (0, 2, 1, 3)))
+        attn_output = ops.transpose(attn_output, axes=(0, 2, 1, 3))
 
         # Reshape: (batch, seq_len, num_heads, d_k) -> (batch, seq_len, d_model)
-        attn_output = Tensor(
-            np.asarray(attn_output).reshape(batch_size, seq_len, self.d_model)
-        )
+        attn_output = ops.reshape(attn_output, newshape=(batch_size, seq_len, self.d_model))
 
         # Final linear projection
         output = self.W_o(attn_output)
@@ -589,6 +625,35 @@ class SelfAttention(Module):
         """
         return self.mha(x, x, x, mask)
 
+
+# ============================================================================
+# LOSS FUNCTIONS
+# ============================================================================
+
+class CrossEntropyLoss(Module):
+    """Cross-entropy loss for multi-class classification."""
+    def forward(self, logits: Tensor, targets) -> Tensor:
+        shape = np.asarray(logits).shape
+        if len(shape) > 2:
+            B, T, V = shape[0], shape[1], shape[2]
+            logits_flat = ops.reshape(logits, newshape=(B * T, V))
+        else:
+            V = shape[1]
+            logits_flat = logits
+            
+        targets_flat = np.asarray(targets).flatten()
+            
+        probs = ops.softmax(logits_flat)
+        eps_tensor = Tensor(np.array([1e-8], dtype=np.float32))
+        log_probs = ops.log(ops.add(probs, eps_tensor))
+        
+        one_hot = np.eye(V, dtype=np.float32)[targets_flat]
+        t_one_hot = Tensor(one_hot)
+        
+        selected = ops.multiply(log_probs, t_one_hot)
+        summed = ops.sum(selected, axis=-1)
+        loss = ops.negative(ops.mean(summed))
+        return loss
 
 # ============================================================================
 # UTILITY LAYERS
@@ -649,12 +714,15 @@ __all__ = [
     # Normalization layers
     "BatchNorm1d",
     "BatchNorm2d",
+    "LayerNorm",
+    "Embedding",
     # Regularization layers
     "Dropout",
     # Attention layers
     "ScaledDotProductAttention",
     "MultiHeadAttention",
     "SelfAttention",
+    "CrossEntropyLoss",
     # Utility layers
     "Flatten",
 ]
