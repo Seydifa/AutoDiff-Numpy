@@ -11,13 +11,23 @@ This module provides a family of optimizers for gradient-based learning:
   - Adagrad (Adaptive Gradient)
   - Adam (Adaptive Moment Estimation)
   - AdamW (Adam with Weight Decay)
+
+v3 changes
+----------
+* All ``step()`` methods now execute the weight update under
+  ``session.no_grad()`` so optimizer arithmetic never adds nodes to the
+  live computation graph.
+* ``LRScheduler`` base class added, together with ``StepLR``,
+  ``CosineAnnealingLR``, ``ReduceLROnPlateau``, and ``WarmupScheduler``.
 """
 
 # Standard library
-from typing import List, Dict, Any
+import math
+from typing import List, Dict, Any, Optional
 
 # Local imports
 from .backend import get_xp
+from .session import session
 
 
 class Optimizer:
@@ -131,10 +141,10 @@ class SGD(Optimizer):
         .. math::
             p \\leftarrow p - \\alpha \\nabla L(p)
         """
-        for p in self.parameters:
-            if p.grad is not None:
-                # W = W - lr * dL/dW
-                p[...] = p - self.lr * p.grad
+        with session.no_grad():
+            for p in self.parameters:
+                if p.grad is not None:
+                    p[...] = p.data - self.lr * p.grad
 
 
 class Adam(Optimizer):
@@ -258,40 +268,40 @@ class Adam(Optimizer):
         bias correction.
         """
         self.t += 1
+        with session.no_grad():
+            for p in self.parameters:
+                if p.grad is None:
+                    continue
 
-        for p in self.parameters:
-            if p.grad is None:
-                continue
+                pid = id(p)
+                grad = p.grad
 
-            pid = id(p)
-            grad = p.grad
+                # 1. Update biased first moment estimate (exponential moving average)
+                #    m_t = beta1 * m_{t-1} + (1 - beta1) * g_t
+                self.m[pid] = self.beta1 * self.m[pid] + (1.0 - self.beta1) * grad
 
-            # 1. Update biased first moment estimate (exponential moving average)
-            #    m_t = beta1 * m_{t-1} + (1 - beta1) * g_t
-            self.m[pid] = self.beta1 * self.m[pid] + (1.0 - self.beta1) * grad
+                # 2. Update biased second moment estimate
+                #    v_t = beta2 * v_{t-1} + (1 - beta2) * g_t^2
+                self.v[pid] = self.beta2 * self.v[pid] + (1.0 - self.beta2) * (grad**2)
 
-            # 2. Update biased second moment estimate
-            #    v_t = beta2 * v_{t-1} + (1 - beta2) * g_t^2
-            self.v[pid] = self.beta2 * self.v[pid] + (1.0 - self.beta2) * (grad**2)
+                # 3. Compute bias-corrected first moment estimate
+                #    m_hat = m_t / (1 - beta1^t)
+                # This is crucial: without bias correction, the early steps
+                # would be dominated by the initialization (zeros), leading
+                # to slow convergence
+                m_hat = self.m[pid] / (1.0 - self.beta1**self.t)
 
-            # 3. Compute bias-corrected first moment estimate
-            #    m_hat = m_t / (1 - beta1^t)
-            # This is crucial: without bias correction, the early steps
-            # would be dominated by the initialization (zeros), leading
-            # to slow convergence
-            m_hat = self.m[pid] / (1.0 - self.beta1**self.t)
+                # 4. Compute bias-corrected second moment estimate
+                #    v_hat = v_t / (1 - beta2^t)
+                v_hat = self.v[pid] / (1.0 - self.beta2**self.t)
 
-            # 4. Compute bias-corrected second moment estimate
-            #    v_hat = v_t / (1 - beta2^t)
-            v_hat = self.v[pid] / (1.0 - self.beta2**self.t)
-
-            # 5. Update parameters
-            #    p = p - lr * m_hat / (sqrt(v_hat) + epsilon)
-            # The denominator sqrt(v_hat) + epsilon provides adaptive per-parameter
-            # learning rates, reducing the effective learning rate for parameters
-            # with large gradient variance and increasing it for those with small variance
-            xp = get_xp(v_hat)
-            p[...] = p - self.lr * m_hat / (xp.sqrt(v_hat) + self.epsilon)
+                # 5. Update parameters
+                #    p = p - lr * m_hat / (sqrt(v_hat) + epsilon)
+                # The denominator sqrt(v_hat) + epsilon provides adaptive per-parameter
+                # learning rates, reducing the effective learning rate for parameters
+                # with large gradient variance and increasing it for those with small variance
+                xp = get_xp(v_hat)
+                p[...] = p.data - self.lr * m_hat / (xp.sqrt(v_hat) + self.epsilon)
 
 
 class Momentum(Optimizer):
@@ -375,25 +385,23 @@ class Momentum(Optimizer):
         Accumulates velocity in the gradient direction and uses it for
         parameter updates, optionally with Nesterov acceleration.
         """
-        for p in self.parameters:
-            if p.grad is None:
-                continue
+        with session.no_grad():
+            for p in self.parameters:
+                if p.grad is None:
+                    continue
 
-            pid = id(p)
-            grad = p.grad
+                pid = id(p)
+                grad = p.grad
 
-            # Accumulate velocity: v = momentum * v + (1 - dampening) * grad
-            buf = self.velocity[pid]
-            buf[:] = self.momentum * buf + (1.0 - self.dampening) * grad
+                # Accumulate velocity: v = momentum * v + (1 - dampening) * grad
+                buf = self.velocity[pid]
+                buf[:] = self.momentum * buf + (1.0 - self.dampening) * grad
 
-            # Update parameters
-            if self.nesterov:
-                # Nesterov momentum: look ahead by adding momentum term
-                # p = p - lr * (grad + momentum * v)
-                p[...] = p - self.lr * (grad + self.momentum * buf)
-            else:
-                # Standard momentum: p = p - lr * v
-                p[...] = p - self.lr * buf
+                # Update parameters
+                if self.nesterov:
+                    p[...] = p.data - self.lr * (grad + self.momentum * buf)
+                else:
+                    p[...] = p.data - self.lr * buf
 
 
 class RMSprop(Optimizer):
@@ -484,30 +492,33 @@ class RMSprop(Optimizer):
         Update each parameter using adaptive learning rates based on
         exponentially decaying averages of squared gradients.
         """
-        for p in self.parameters:
-            if p.grad is None:
-                continue
+        with session.no_grad():
+            for p in self.parameters:
+                if p.grad is None:
+                    continue
 
-            pid = id(p)
-            grad = p.grad
+                pid = id(p)
+                grad = p.grad
 
-            # Update square gradient average: v = alpha * v + (1-alpha) * g^2
-            self.sq_avg[pid] = self.alpha * self.sq_avg[pid] + (1.0 - self.alpha) * (
-                grad**2
-            )
+                # Update square gradient average: v = alpha * v + (1-alpha) * g^2
+                self.sq_avg[pid] = self.alpha * self.sq_avg[pid] + (
+                    1.0 - self.alpha
+                ) * (grad**2)
 
-            if self.centered:
-                # Centered RMSprop: normalize by centered variance
-                self.buffer[pid] = (
-                    self.alpha * self.buffer[pid] + (1.0 - self.alpha) * grad
-                )
-                denominator = self.sq_avg[pid] - self.buffer[pid] ** 2 + self.epsilon
-            else:
-                denominator = self.sq_avg[pid] + self.epsilon
+                if self.centered:
+                    # Centered RMSprop: normalize by centered variance
+                    self.buffer[pid] = (
+                        self.alpha * self.buffer[pid] + (1.0 - self.alpha) * grad
+                    )
+                    denominator = (
+                        self.sq_avg[pid] - self.buffer[pid] ** 2 + self.epsilon
+                    )
+                else:
+                    denominator = self.sq_avg[pid] + self.epsilon
 
-            # Update parameter: p = p - lr * grad / sqrt(denominator)
-            xp = get_xp(denominator)
-            p[...] = p - self.lr * grad / xp.sqrt(denominator)
+                # Update parameter: p = p - lr * grad / sqrt(denominator)
+                xp = get_xp(denominator)
+                p[...] = p.data - self.lr * grad / xp.sqrt(denominator)
 
 
 class Adagrad(Optimizer):
@@ -585,19 +596,22 @@ class Adagrad(Optimizer):
         Accumulates squared gradients and uses their square root to
         scale the learning rate for each parameter individually.
         """
-        for p in self.parameters:
-            if p.grad is None:
-                continue
+        with session.no_grad():
+            for p in self.parameters:
+                if p.grad is None:
+                    continue
 
-            pid = id(p)
-            grad = p.grad
+                pid = id(p)
+                grad = p.grad
 
-            # Accumulate squared gradients: G = G_prev + g^2
-            self.sq_sum[pid] = self.sq_sum[pid] + grad**2
+                # Accumulate squared gradients: G = G_prev + g^2
+                self.sq_sum[pid] = self.sq_sum[pid] + grad**2
 
-            # Update parameter: p = p - lr * grad / sqrt(G + epsilon)
-            xp = get_xp(self.sq_sum[pid])
-            p[...] = p - self.lr * grad / (xp.sqrt(self.sq_sum[pid]) + self.epsilon)
+                # Update parameter: p = p - lr * grad / sqrt(G + epsilon)
+                xp = get_xp(self.sq_sum[pid])
+                p[...] = p.data - self.lr * grad / (
+                    xp.sqrt(self.sq_sum[pid]) + self.epsilon
+                )
 
 
 class AdamW(Optimizer):
@@ -705,28 +719,258 @@ class AdamW(Optimizer):
         weight decay regularization.
         """
         self.t += 1
+        with session.no_grad():
+            for p in self.parameters:
+                if p.grad is None:
+                    continue
 
-        for p in self.parameters:
-            if p.grad is None:
-                continue
+                pid = id(p)
+                grad = p.grad
 
-            pid = id(p)
-            grad = p.grad
+                # Update biased first moment estimate
+                self.m[pid] = self.beta1 * self.m[pid] + (1.0 - self.beta1) * grad
 
-            # Update biased first moment estimate
-            self.m[pid] = self.beta1 * self.m[pid] + (1.0 - self.beta1) * grad
+                # Update biased second moment estimate
+                self.v[pid] = self.beta2 * self.v[pid] + (1.0 - self.beta2) * (grad**2)
 
-            # Update biased second moment estimate
-            self.v[pid] = self.beta2 * self.v[pid] + (1.0 - self.beta2) * (grad**2)
+                # Bias correction
+                m_hat = self.m[pid] / (1.0 - self.beta1**self.t)
+                v_hat = self.v[pid] / (1.0 - self.beta2**self.t)
 
-            # Bias correction
-            m_hat = self.m[pid] / (1.0 - self.beta1**self.t)
-            v_hat = self.v[pid] / (1.0 - self.beta2**self.t)
+                # AdamW update: adaptive step + decoupled weight decay
+                # The key difference from Adam: weight decay is applied directly,
+                # not scaled by the adaptive learning rate
+                xp = get_xp(v_hat)
+                adaptive_update = self.lr * m_hat / (xp.sqrt(v_hat) + self.epsilon)
+                weight_decay_update = self.weight_decay * self.lr * p.data
+                p[...] = p.data - adaptive_update - weight_decay_update
 
-            # AdamW update: adaptive step + decoupled weight decay
-            # The key difference from Adam: weight decay is applied directly,
-            # not scaled by the adaptive learning rate
-            xp = get_xp(v_hat)
-            adaptive_update = self.lr * m_hat / (xp.sqrt(v_hat) + self.epsilon)
-            weight_decay_update = self.weight_decay * self.lr * p.data
-            p[...] = p.data - adaptive_update - weight_decay_update
+
+# =============================================================================
+# LEARNING RATE SCHEDULERS
+# =============================================================================
+
+
+class LRScheduler:
+    """Base class for all learning rate schedulers.
+
+    A scheduler wraps an optimizer and adjusts its ``lr`` attribute
+    after each call to :meth:`step`.
+
+    Parameters
+    ----------
+    optimizer : Optimizer
+        The optimizer whose learning rate will be scheduled.
+    last_epoch : int, default=-1
+        The index of the last epoch (used to compute the LR for the
+        *next* epoch on the first :meth:`step` call).  Set to -1 to
+        start from epoch 0.
+    """
+
+    def __init__(self, optimizer: Optimizer, last_epoch: int = -1):
+        self.optimizer = optimizer
+        self.last_epoch = last_epoch
+        self.base_lr = optimizer.lr
+        self.step()  # set lr for epoch 0
+
+    def get_lr(self) -> float:
+        """Compute the learning rate for the *current* epoch.  Override in subclasses."""
+        raise NotImplementedError
+
+    def step(self) -> None:
+        """Advance one epoch and update ``optimizer.lr``."""
+        self.last_epoch += 1
+        self.optimizer.lr = self.get_lr()
+
+
+class StepLR(LRScheduler):
+    """Decay the learning rate by *gamma* every *step_size* epochs.
+
+    .. math::
+        lr = lr_{base} \\cdot \\gamma^{\\lfloor epoch / step_size \\rfloor}
+
+    Parameters
+    ----------
+    optimizer : Optimizer
+    step_size : int
+        Period (in epochs) between LR decays.
+    gamma : float, default=0.1
+        Multiplicative decay factor.
+    """
+
+    def __init__(
+        self,
+        optimizer: Optimizer,
+        step_size: int,
+        gamma: float = 0.1,
+        last_epoch: int = -1,
+    ):
+        self.step_size = step_size
+        self.gamma = gamma
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self) -> float:
+        return self.base_lr * (self.gamma ** (self.last_epoch // self.step_size))
+
+
+class MultiStepLR(LRScheduler):
+    """Decay the learning rate by *gamma* at each milestone epoch.
+
+    Parameters
+    ----------
+    optimizer : Optimizer
+    milestones : list[int]
+        List of epoch indices at which to decay the LR.
+    gamma : float, default=0.1
+        Multiplicative decay factor applied at each milestone.
+    """
+
+    def __init__(
+        self,
+        optimizer: Optimizer,
+        milestones: List[int],
+        gamma: float = 0.1,
+        last_epoch: int = -1,
+    ):
+        self.milestones = sorted(milestones)
+        self.gamma = gamma
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self) -> float:
+        n_decays = sum(1 for m in self.milestones if self.last_epoch >= m)
+        return self.base_lr * (self.gamma**n_decays)
+
+
+class CosineAnnealingLR(LRScheduler):
+    """Cosine annealing schedule: LR oscillates between *eta_min* and *base_lr*.
+
+    .. math::
+        lr_t = \\eta_{min} + \\frac{1}{2}(lr_{base} - \\eta_{min})
+               \\left(1 + \\cos\\left(\\frac{\\pi \\cdot t}{T_{max}}\\right)\\right)
+
+    Parameters
+    ----------
+    optimizer : Optimizer
+    T_max : int
+        Maximum number of iterations (half a cosine cycle).
+    eta_min : float, default=0.0
+        Minimum learning rate.
+    """
+
+    def __init__(
+        self,
+        optimizer: Optimizer,
+        T_max: int,
+        eta_min: float = 0.0,
+        last_epoch: int = -1,
+    ):
+        self.T_max = T_max
+        self.eta_min = eta_min
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self) -> float:
+        t = self.last_epoch
+        return (
+            self.eta_min
+            + (self.base_lr - self.eta_min)
+            * (1 + math.cos(math.pi * t / self.T_max))
+            / 2
+        )
+
+
+class ReduceLROnPlateau:
+    """Reduce learning rate when a metric has stopped improving.
+
+    Once no improvement is observed for *patience* consecutive steps, the
+    learning rate is multiplied by *factor*.
+
+    Parameters
+    ----------
+    optimizer : Optimizer
+    mode : {'min', 'max'}, default='min'
+        Whether to reduce LR when the metric stops *decreasing* ('min')
+        or *increasing* ('max').
+    factor : float, default=0.1
+        Factor by which to reduce the LR (new_lr = lr * factor).
+    patience : int, default=10
+        Number of steps with no improvement before reducing LR.
+    min_lr : float, default=0.0
+        Lower bound on the learning rate.
+    threshold : float, default=1e-4
+        Minimum change to qualify as an improvement.
+    """
+
+    def __init__(
+        self,
+        optimizer: Optimizer,
+        mode: str = "min",
+        factor: float = 0.1,
+        patience: int = 10,
+        min_lr: float = 0.0,
+        threshold: float = 1e-4,
+    ):
+        self.optimizer = optimizer
+        self.mode = mode
+        self.factor = factor
+        self.patience = patience
+        self.min_lr = min_lr
+        self.threshold = threshold
+        self._best: Optional[float] = None
+        self._num_bad = 0
+
+    def _is_better(self, current: float) -> bool:
+        if self._best is None:
+            return True
+        if self.mode == "min":
+            return current < self._best - self.threshold
+        return current > self._best + self.threshold
+
+    def step(self, metric: float) -> None:
+        """Update the LR based on the metric value."""
+        if self._is_better(metric):
+            self._best = metric
+            self._num_bad = 0
+        else:
+            self._num_bad += 1
+            if self._num_bad >= self.patience:
+                new_lr = max(self.optimizer.lr * self.factor, self.min_lr)
+                self.optimizer.lr = new_lr
+                self._num_bad = 0
+
+
+class WarmupScheduler(LRScheduler):
+    """Linear warm-up then delegate to a base scheduler.
+
+    Linearly increases the LR from 0 to *base_lr* over *warmup_epochs*
+    epochs, then hands off to *after_scheduler* for the remainder.
+
+    Parameters
+    ----------
+    optimizer : Optimizer
+    warmup_epochs : int
+        Number of warm-up epochs.
+    after_scheduler : LRScheduler
+        Scheduler to use after warm-up is complete.
+    """
+
+    def __init__(
+        self,
+        optimizer: Optimizer,
+        warmup_epochs: int,
+        after_scheduler: LRScheduler,
+        last_epoch: int = -1,
+    ):
+        self.warmup_epochs = warmup_epochs
+        self.after_scheduler = after_scheduler
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self) -> float:
+        if self.last_epoch < self.warmup_epochs:
+            return self.base_lr * (self.last_epoch + 1) / self.warmup_epochs
+        return self.after_scheduler.get_lr()
+
+    def step(self) -> None:
+        self.last_epoch += 1
+        if self.last_epoch >= self.warmup_epochs:
+            self.after_scheduler.last_epoch = self.last_epoch - self.warmup_epochs
+        self.optimizer.lr = self.get_lr()

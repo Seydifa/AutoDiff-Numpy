@@ -73,25 +73,25 @@ close = lambda a, b: np.allclose(a, b, atol=1e-5)
 
 class TestOpsClass:
     def test_forward_call(self):
-        op = Ops(np.add, VJP_RULES[np.add], name="test_add")
+        op = Ops(np.add, name="test_add")
         result = op(np.array([1.0]), np.array([2.0]))
         assert close(result, np.array([3.0]))
 
     def test_vpj_delegation(self):
-        op = Ops(np.add, VJP_RULES[np.add], name="test_add")
+        op = Ops(np.add, name="test_add")
         gx, gy = op.vpj(np.ones(2), np.array([1.0, 2.0]), np.array([3.0, 4.0]))
         assert close(gx, np.ones(2)) and close(gy, np.ones(2))
 
     def test_name_attribute(self):
-        op = Ops(np.add, VJP_RULES[np.add], name="my_op")
+        op = Ops(np.add, name="my_op")
         assert op.name == "my_op"
 
     def test_repr_contains_name(self):
-        op = Ops(np.exp, VJP_RULES[np.exp], name="exp")
+        op = Ops(np.exp, name="exp")
         assert "exp" in repr(op)
 
     def test_auto_name_from_func(self):
-        op = Ops(np.sqrt, VJP_RULES[np.sqrt])
+        op = Ops(np.sqrt)
         assert op.name == "sqrt"
 
 
@@ -193,7 +193,7 @@ class TestForwardPass:
 
     def test_softmax(self):
         x = np.array([[1.0, 2.0, 3.0]])
-        assert close(softmax(x).sum(), 1.0)
+        assert close(softmax(x).data.sum(), 1.0)
 
     def test_matmul_shape(self):
         A = np.ones((2, 3))

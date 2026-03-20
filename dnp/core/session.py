@@ -14,16 +14,82 @@ training path never touches an nx.DiGraph — only two plain dicts are updated
 (O(1) per node/edge), which eliminates the networkx overhead from every
 forward pass.  When ``show_graph()`` or ``session.G`` is accessed, an
 nx.DiGraph is built on-demand from those dicts in O(n).
+
+v3 additions
+------------
+* ``graph_fn`` decorator — wraps any callable so that raw numpy/cupy arrays
+  and Python scalars are automatically promoted to Tensor before the function
+  body executes.  This makes every op graph-compatible with zero boilerplate.
+* ``session.graph()`` context manager — resets the graph on entry and on exit,
+  giving a clean per-forward-pass scope for memory management.
 """
 
 # Standard library
+import functools
 from contextlib import contextmanager
+
+# Third-party
+import numpy as np
 
 # Optional visualization support
 try:
     import matplotlib.pyplot as plt
 except ImportError:
     plt = None
+
+
+# ---------------------------------------------------------------------------
+# graph_fn decorator
+# ---------------------------------------------------------------------------
+
+
+def graph_fn(func):
+    """Decorator that auto-converts non-Tensor inputs to Tensor.
+
+    Any positional or keyword argument that is a numpy/cupy ndarray or a plain
+    Python scalar (int, float) is transparently wrapped in a :class:`Tensor`
+    before the decorated function runs.  Arguments that are already a
+    :class:`Tensor` pass through unmodified.
+
+    Usage
+    -----
+    >>> @graph_fn
+    ... def my_op(x, y):
+    ...     return x + y
+    ...
+    >>> my_op(np.array([1.0, 2.0]), np.array([3.0, 4.0]))
+    # Both arrays are now Tensors inside my_op
+
+    Notes
+    -----
+    The import of :class:`Tensor` is deferred to avoid circular-import issues
+    (``tensor.py`` imports ``session``, so we cannot import it at module level).
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        from .tensor import Tensor  # deferred — avoids circular import
+        from .backend import get_xp
+
+        def _to_tensor(v):
+            if isinstance(v, Tensor):
+                return v
+            # Only promote ndarray-like objects (numpy / cupy arrays).
+            # Plain Python scalars (int, float, bool) and structural params
+            # (axis, shape, keepdims, p, training, …) are intentionally left
+            # as-is so ops like expand_dims(x, 0) and dropout(x, p=0.5) work.
+            if hasattr(v, "shape") and hasattr(v, "dtype"):
+                xp = get_xp(v)
+                if xp is not None:
+                    return Tensor(v, name="input")
+            return v  # leave int, float, bool, tuple, str, etc. unchanged
+
+        new_args = tuple(_to_tensor(a) for a in args)
+        new_kwargs = {k: _to_tensor(v) for k, v in kwargs.items()}
+        return func(*new_args, **new_kwargs)
+
+    wrapper._graph_fn = True  # sentinel so callers can detect decoration
+    return wrapper
 
 
 class SessionGraph:
@@ -97,6 +163,34 @@ class SessionGraph:
         self._nodes.clear()
         self._edges.clear()
         self.compteur = 0
+
+    @contextmanager
+    def graph(self):
+        """Context manager for a clean per-forward-pass computation graph.
+
+        Resets the session graph on entry so stale nodes from previous
+        iterations are removed, preventing the unbounded memory growth that
+        occurs when the global session accumulates nodes across training steps.
+
+        After the ``with`` block exits (whether normally or via exception)
+        the graph is reset again so parameter tensors re-register on the
+        next forward pass.
+
+        Example
+        -------
+        >>> for x_batch, y_batch in dataloader:
+        ...     with session.graph():
+        ...         pred = model(x_batch)
+        ...         loss = criterion(pred, y_batch)
+        ...         loss.backward()
+        ...     optimizer.step()
+        ...     optimizer.zero_grad()
+        """
+        self.reset()
+        try:
+            yield self
+        finally:
+            pass  # graph stays alive so backward() can traverse it after the block
 
     # ------------------------------------------------------------------
     # Backward-compatible nx.DiGraph property (built on-demand)

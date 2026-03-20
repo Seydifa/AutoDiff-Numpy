@@ -4,6 +4,10 @@ from . import ops, core
 # Dtype control — primary public API
 from .core.backend import set_dtype, get_dtype
 
+# Tensor and session — required for any computation
+from .core.tensor import Tensor
+from .core.session import session, graph_fn
+
 # Local imports: Layer classes available at top level
 from .layers import (
     Module,
@@ -34,6 +38,23 @@ from .core.optimizers import (
     Adagrad,
     Adam,
     AdamW,
+    # Schedulers (v3)
+    LRScheduler,
+    StepLR,
+    MultiStepLR,
+    CosineAnnealingLR,
+    ReduceLROnPlateau,
+    WarmupScheduler,
+)
+
+# Training utilities (v3)
+from .utils import (
+    Callback,
+    EarlyStopping,
+    History,
+    ModelCheckpoint,
+    ProgressLogger,
+    Trainer,
 )
 
 __all__ = [
@@ -42,6 +63,10 @@ __all__ = [
     # Dtype control
     "set_dtype",
     "get_dtype",
+    # Core autograd
+    "Tensor",
+    "session",
+    "graph_fn",
     # Base classes
     "Module",
     "Sequential",
@@ -76,4 +101,18 @@ __all__ = [
     "Adagrad",
     "Adam",
     "AdamW",
+    # LR Schedulers
+    "LRScheduler",
+    "StepLR",
+    "MultiStepLR",
+    "CosineAnnealingLR",
+    "ReduceLROnPlateau",
+    "WarmupScheduler",
+    # Training utilities
+    "Callback",
+    "EarlyStopping",
+    "History",
+    "ModelCheckpoint",
+    "ProgressLogger",
+    "Trainer",
 ]

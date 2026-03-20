@@ -44,17 +44,117 @@ from .ops import (
 # ============================================================================
 
 
+def _apply_initializer(name: str, shape, dtype) -> np.ndarray:
+    """Resolve a built-in initializer name to an initial weight ndarray."""
+    fan_in = shape[0] if len(shape) >= 1 else 1
+    fan_out = shape[1] if len(shape) >= 2 else 1
+    limit: float
+    if name == "glorot_uniform":
+        limit = np.sqrt(6.0 / (fan_in + fan_out))
+        return np.random.uniform(-limit, limit, shape).astype(dtype)
+    if name == "glorot_normal":
+        std = np.sqrt(2.0 / (fan_in + fan_out))
+        return np.random.randn(*shape).astype(dtype) * std
+    if name == "he_normal":
+        std = np.sqrt(2.0 / fan_in)
+        return np.random.randn(*shape).astype(dtype) * std
+    if name == "ones":
+        return np.ones(shape, dtype=dtype)
+    if name == "zeros":
+        return np.zeros(shape, dtype=dtype)
+    if name == "uniform":
+        return np.random.uniform(-0.05, 0.05, shape).astype(dtype)
+    raise ValueError(
+        f"Unknown initializer '{name}'. "
+        "Choose from 'glorot_uniform', 'glorot_normal', 'he_normal', 'ones', 'zeros', 'uniform'."
+    )
+
+
 class Module:
-    """Base class for all neural network modules."""
+    """Base class for all neural network modules.
+
+    v3 additions
+    ------------
+    * ``add_weight(name, shape, initializer, trainable, **kwargs)`` —
+      structured weight registration inspired by Keras.  Weights registered
+      through this API are accessible both as ``self.<name>`` and through
+      ``self.parameters()`` (if trainable).  Non-trainable weights are stored
+      in ``_buffers`` and not returned by ``parameters()``.
+    * ``_buffers`` dict for non-trainable persistent state (e.g. running stats).
+    """
 
     def __init__(self):
         # Use __dict__ directly to avoid triggering __setattr__ recursively.
-        self.__dict__["_parameters"] = {}
+        self.__dict__["_parameters"] = {}  # trainable weights
+        self.__dict__["_nontrainable"] = {}  # non-trainable tensors
+        self.__dict__["_buffers"] = {}  # plain arrays (not Tensors)
         self.__dict__["_modules"] = {}
+
+    # ------------------------------------------------------------------
+    # weight registration API
+    # ------------------------------------------------------------------
+
+    def add_weight(
+        self,
+        name: str,
+        shape,
+        initializer="glorot_uniform",
+        trainable: bool = True,
+        dtype=None,
+        **kwargs,
+    ) -> "Tensor":
+        """Create and register a weight tensor.
+
+        Parameters
+        ----------
+        name : str
+            Attribute name under which the weight is stored (``self.<name>``).
+        shape : tuple
+            Shape of the weight tensor.
+        initializer : str or callable, default='glorot_uniform'
+            How to initialise the weight data.  Built-in options:
+            ``'glorot_uniform'``, ``'glorot_normal'``, ``'he_normal'``,
+            ``'ones'``, ``'zeros'``, ``'uniform'``, or any callable
+            that accepts *shape* and returns an ndarray.
+        trainable : bool, default=True
+            If ``True`` the weight is returned by ``parameters()`` and
+            receives gradients during ``backward()``.  If ``False``
+            it is stored in ``_nontrainable`` (accessible as
+            ``self.<name>`` but skipped by optimizers).
+        dtype : numpy dtype or None
+            Override the global default dtype.
+
+        Returns
+        -------
+        Tensor
+            The newly created weight tensor (also set as ``self.<name>``).
+        """
+        from .backend import get_dtype
+
+        _dtype = dtype or get_dtype()
+
+        if callable(initializer) and not isinstance(initializer, str):
+            data = initializer(shape).astype(_dtype)
+        else:
+            data = _apply_initializer(initializer, shape, _dtype)
+
+        w = Tensor(data, name=f"{self.__class__.__name__}.{name}")
+        object.__setattr__(self, name, w)
+        if trainable:
+            self._parameters[name] = w
+        else:
+            self._nontrainable[name] = w
+        return w
+
+    # ------------------------------------------------------------------
+    # attribute routing
+    # ------------------------------------------------------------------
 
     def __setattr__(self, name, value):
         if isinstance(value, Tensor):
-            self._parameters[name] = value
+            # Registered via add_weight? Don't double-register.
+            if name not in self._parameters and name not in self._nontrainable:
+                self._parameters[name] = value
         elif isinstance(value, Module):
             self._modules[name] = value
         super().__setattr__(name, value)
@@ -482,11 +582,10 @@ class LayerNorm(Module):
     def forward(self, x: Tensor) -> Tensor:
         mean = ops.mean(x, axis=-1, keepdims=True)
         diff = x - mean
-        # ops.square (not diff**2) — the scalar exponent 2 is not a Tensor and
-        # therefore not stored as a parent, which breaks the np.power VJP.
         var = ops.mean(ops.square(diff), axis=-1, keepdims=True)
-        eps_t = Tensor(np.array([self.eps]))  # float64 — matches default tensor dtype
-        std = ops.sqrt(var + eps_t)
+        # Use a plain Python float for eps — not a Tensor leaf node, so it
+        # does not add a spurious node to the session graph on each forward call.
+        std = ops.sqrt(var + float(self.eps))
         x_norm = diff / std
         out = x_norm * self.gamma
         if self.use_bias:
@@ -495,18 +594,58 @@ class LayerNorm(Module):
 
 
 class Embedding(Module):
-    """Embedding layer constructed with one-hot encoding for autograd compatibility."""
+    """Embedding lookup layer with efficient direct-index slicing.
 
-    def __init__(self, num_embeddings, embedding_dim, name="Embedding"):
+    v3: Replaced the O(vocab_size) one-hot matrix-multiply with a direct
+    index slice ``W[indices]``, reducing memory from O(seq_len * vocab_size)
+    to O(seq_len * embed_dim).  The custom ``_gather`` op wires a
+    scatter-add VJP so gradients flow back to the embedding weight matrix.
+    """
+
+    def __init__(
+        self, num_embeddings: int, embedding_dim: int, name: str = "Embedding"
+    ):
         super().__init__()
-        self.lin = Linear(num_embeddings, embedding_dim, bias=False, name=name)
+        std = np.sqrt(1.0 / num_embeddings)
+        self.W = Tensor(
+            np.random.randn(num_embeddings, embedding_dim) * std,
+            name=f"{name}_weight",
+        )
         self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
 
     def forward(self, x_idx):
+        """x_idx : integer array / Tensor of shape (seq_len,) or (batch, seq_len)."""
         x_np = as_numpy(x_idx.data if isinstance(x_idx, Tensor) else x_idx).astype(int)
-        one_hot = np.eye(self.num_embeddings, dtype=np.float32)[x_np]
-        # Inherit device from embedding weight so GPU models stay on GPU
-        return self.lin(Tensor(one_hot, device=self.lin.W.device))
+        # Direct slice — O(seq_len * embed_dim) instead of O(seq_len * vocab_size)
+        out_data = self.W.data[x_np]  # shape: (*x_idx.shape, embed_dim)
+        out = Tensor(
+            out_data,
+            parents=[self.W],
+            op_func=_embedding_gather,
+            op_kwargs={"indices": x_np},
+            name="Embedding_out",
+        )
+        return out
+
+
+def _embedding_gather(W, indices):
+    """Forward: W[indices]  (stored as op_func key in VJP_RULES)."""
+    return W[indices]
+
+
+def _vjp_embedding_gather(g, W, indices):
+    """Scatter-add: dW[i] += sum of upstream grads that selected row i."""
+    xp = get_xp(g)
+    dW = xp.zeros_like(W)
+    xp.add.at(dW, indices, g)
+    return (dW,)
+
+
+# Register VJP for the embedding gather op.
+from .vjp_rules import VJP_RULES  # noqa: E402  (local import avoids circularity)
+
+VJP_RULES[_embedding_gather] = _vjp_embedding_gather
 
 
 # ============================================================================
@@ -559,10 +698,9 @@ class ScaledDotProductAttention(Module):
         key_T = ops.transpose(key, axes=tuple(axes))
 
         scores = query @ key_T
-        # Keep the scale scalar on the same device as the query (CPU or GPU)
-        scores = scores * Tensor(
-            np.array([self.scale], dtype=np.float32), device=query.device
-        )
+        # Multiply by a Python float — avoids creating a leaf Tensor node on
+        # every forward call, which would grow the session graph indefinitely.
+        scores = scores * self.scale
 
         if mask is not None:
             scores = scores + mask
@@ -669,8 +807,8 @@ class CrossEntropyLoss(Module):
         )
 
         probs = ops.softmax(logits_flat)
-        eps_tensor = Tensor(np.array([1e-8]))  # float64
-        log_probs = ops.log(probs + eps_tensor)
+        # Use Python float — avoids adding a spurious leaf Tensor node each forward call.
+        log_probs = ops.log(probs + 1e-8)
 
         one_hot = np.eye(V)[targets_np]  # float64
         t_one_hot = Tensor(one_hot)

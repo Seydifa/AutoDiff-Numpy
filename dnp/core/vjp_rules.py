@@ -190,10 +190,16 @@ def avg_pool2d(x, kernel_size, stride=1, padding=0):
 
 
 def dropout(x, p=0.5, training=True):
+    """Dropout forward — stores the binary mask so the VJP can reuse it.
+
+    Returns the masked/scaled output.  The mask is NOT stored inside this
+    function; the mask is generated in ``_DropoutOps._raw_call`` which writes
+    it into ``op_kwargs["mask"]`` so ``Tensor.backward()`` can retrieve it.
+    """
     if not training or p == 0:
         return x
     xp = get_xp(x)
-    mask = xp.random.binomial(1, 1 - p, size=x.shape)
+    mask = (xp.random.uniform(size=x.shape) >= p).astype(x.dtype)
     return x * mask / (1 - p)
 
 
@@ -352,6 +358,29 @@ def _vjp_softmax(g, x):
 
 
 # ---------------------------------------------------------------------------
+# Reduction-axis helper
+# ---------------------------------------------------------------------------
+
+
+def _restore_reduced_dims(g, x_shape, axis, keepdims):
+    """Re-insert the squeezed axes into *g* so it broadcasts to *x_shape*.
+
+    Handles axis=None (full reduction), axis=int, and axis=tuple.
+    Works on NumPy < 2.0 which does not accept a tuple axis in expand_dims.
+    """
+    xp = get_xp(g)
+    if keepdims or axis is None:
+        return g * xp.ones(x_shape, dtype=g.dtype)
+    if isinstance(axis, (list, tuple)):
+        result = g
+        for ax in sorted(int(a) % len(x_shape) for a in axis):
+            result = xp.expand_dims(result, ax)
+    else:
+        result = xp.expand_dims(g, axis)
+    return result * xp.ones(x_shape, dtype=g.dtype)
+
+
+# ---------------------------------------------------------------------------
 # VJP Rules dictionary
 # ---------------------------------------------------------------------------
 
@@ -417,37 +446,38 @@ VJP_RULES = {
     np.dot: lambda g, x, y: (get_xp(g).dot(g, y.T), get_xp(g).dot(x.T, g)),
     # Reductions
     np.sum: lambda g, x, axis=None, keepdims=False: (
-        (g if keepdims else get_xp(g).expand_dims(g, axis) if axis is not None else g)
-        * get_xp(x).ones_like(x),
+        _restore_reduced_dims(g, x.shape, axis, keepdims),
     ),
     np.mean: lambda g, x, axis=None, keepdims=False: (
-        (
-            (
-                g
-                if keepdims
-                else get_xp(g).expand_dims(g, axis)
-                if axis is not None
-                else g
-            )
-            * get_xp(x).ones_like(x)
-        )
+        _restore_reduced_dims(g, x.shape, axis, keepdims)
         / (
-            get_xp(x).prod(get_xp(x).array(x.shape)[axis])
+            int(
+                get_xp(x).prod(
+                    get_xp(x).array(
+                        [
+                            x.shape[a]
+                            for a in (
+                                axis if isinstance(axis, (list, tuple)) else [axis]
+                            )
+                        ]
+                    )
+                )
+            )
             if axis is not None
             else x.size
         ),
     ),
     np.prod: lambda g, x, axis=None, keepdims=False: (
-        (g if keepdims else get_xp(g).expand_dims(g, axis) if axis is not None else g)
+        _restore_reduced_dims(g, x.shape, axis, keepdims)
         * (get_xp(x).prod(x, axis=axis, keepdims=True) / (x + EPSILON)),
     ),
     np.max: lambda g, x, axis=None, keepdims=False: (
-        (g if keepdims else get_xp(g).expand_dims(g, axis) if axis is not None else g)
-        * (x == get_xp(x).max(x, axis=axis, keepdims=True)),
+        _restore_reduced_dims(g, x.shape, axis, keepdims)
+        * (x == get_xp(x).max(x, axis=axis, keepdims=True)).astype(g.dtype),
     ),
     np.min: lambda g, x, axis=None, keepdims=False: (
-        (g if keepdims else get_xp(g).expand_dims(g, axis) if axis is not None else g)
-        * (x == get_xp(x).min(x, axis=axis, keepdims=True)),
+        _restore_reduced_dims(g, x.shape, axis, keepdims)
+        * (x == get_xp(x).min(x, axis=axis, keepdims=True)).astype(g.dtype),
     ),
     # Shape operations — _reshape is populated after the dict (see below).
     np.transpose: lambda g, x, axes=None: (
@@ -495,7 +525,14 @@ VJP_RULES = {
     avg_pool2d: lambda g, x, kernel_size, stride=1, padding=0: (
         _avg_pool2d_backward(g, x, kernel_size, stride, padding),
     ),
-    dropout: lambda g, x, p=0.5, training=True: (g / (1 - p),) if training else (g,),
+    dropout: lambda g, x, p=0.5, training=True, mask=None: (
+        # Use the recorded binary mask; fall back gracefully if absent.
+        (g * mask,)
+        if (training and mask is not None)
+        else (g / (1 - p),)
+        if training
+        else (g,)
+    ),
     batch_norm: lambda g, x, weight, bias, mean, var, eps=1e-5: _batch_norm_backward(
         g, x, weight, bias, mean, var, eps
     ),
@@ -616,14 +653,30 @@ def _batch_norm_backward(g, x, weight, bias, mean, var, eps=1e-5):
     xp = get_xp(x)
     x_norm = (x - mean) / xp.sqrt(var + eps)
     grad_x_norm = g * weight
-    N = x.shape[0]
+
+    # Determine the reduction axes: for BatchNorm2d, normalization is over
+    # (batch, H, W) simultaneously (axes 0, 2, 3); for BatchNorm1d, only
+    # axis 0.  We infer this from the rank of the input.
+    if x.ndim == 4:
+        # BatchNorm2d: x shape = (B, C, H, W), mean/var shape = (1, C, 1, 1)
+        norm_axes = (0, 2, 3)
+        N = x.shape[0] * x.shape[2] * x.shape[3]
+    else:
+        # BatchNorm1d: x shape = (B, C), mean/var shape = (C,)
+        norm_axes = (0,)
+        N = x.shape[0]
+
+    std = xp.sqrt(var + eps)
     grad_x = (
-        grad_x_norm / xp.sqrt(var + eps)
-        - (grad_x_norm * x_norm) * (1 / (var + eps)) * (x - mean) / N
-        - xp.mean(grad_x_norm, axis=0, keepdims=True) / xp.sqrt(var + eps)
+        (1.0 / N)
+        * (1.0 / std)
+        * (
+            N * grad_x_norm
+            - xp.sum(grad_x_norm, axis=norm_axes, keepdims=True)
+            - x_norm * xp.sum(grad_x_norm * x_norm, axis=norm_axes, keepdims=True)
+        )
     )
     # Gradients for the affine parameters γ (weight) and β (bias)
-    # Sum over all dimensions that were broadcast-expanded relative to weight/bias shape
     grad_weight = unbroadcast(g * x_norm, weight.shape)
     grad_bias = unbroadcast(g, bias.shape)
     return grad_x, grad_weight, grad_bias

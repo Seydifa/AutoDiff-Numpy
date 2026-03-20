@@ -280,3 +280,53 @@ class Tensor:
         from .ops import negative
 
         return negative(self)
+
+    # --- Comparison operators (return plain numpy bool arrays, not tracked) ---
+    # These are intentionally non-differentiable (used for masks / conditions).
+
+    def __eq__(self, other):
+        other_data = other.data if isinstance(other, Tensor) else other
+        return self.data == other_data
+
+    def __ne__(self, other):
+        other_data = other.data if isinstance(other, Tensor) else other
+        return self.data != other_data
+
+    def __lt__(self, other):
+        other_data = other.data if isinstance(other, Tensor) else other
+        return self.data < other_data
+
+    def __le__(self, other):
+        other_data = other.data if isinstance(other, Tensor) else other
+        return self.data <= other_data
+
+    def __gt__(self, other):
+        other_data = other.data if isinstance(other, Tensor) else other
+        return self.data > other_data
+
+    def __ge__(self, other):
+        other_data = other.data if isinstance(other, Tensor) else other
+        return self.data >= other_data
+
+    def __abs__(self):
+        from .ops import absolute
+
+        return absolute(self)
+
+    # --- Detach: leaf copy with no gradient history ---
+
+    def detach(self):
+        """Return a new leaf Tensor that shares no gradient history with self.
+
+        Useful for implementing stop-gradient, target networks, or returning
+        a value without propagating through it during ``backward()``.
+
+        Example
+        -------
+        >>> target = current_params.detach()   # no gradient through target
+        """
+        return Tensor(
+            self.data.copy(),
+            name=self.name + "_detached",
+            device=self.device,
+        )

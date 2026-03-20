@@ -13,11 +13,14 @@ from dnp.core.layers import (
     Softmax,
     BatchNorm1d,
     BatchNorm2d,
+    LayerNorm,
+    Embedding,
     Dropout,
     ScaledDotProductAttention,
     MultiHeadAttention,
     SelfAttention,
     Flatten,
+    CrossEntropyLoss,
 )
 
 __all__ = [
@@ -39,8 +42,13 @@ __all__ = [
     # Normalization layers
     "BatchNorm1d",
     "BatchNorm2d",
+    "LayerNorm",
+    # Embedding
+    "Embedding",
     # Regularization layers
     "Dropout",
+    # Loss layers
+    "CrossEntropyLoss",
     # Attention layers
     "ScaledDotProductAttention",
     "MultiHeadAttention",
