@@ -267,8 +267,25 @@ class Conv2d(Module):
             x_padded, self.W.data, stride_h, stride_w, H_out, W_out
         )
 
-        # Wrap result in Tensor and add bias
-        y = Tensor(y_data, parents=[x, self.W], op_func=None, name="Conv2d_forward")
+        # Wrap result in Tensor.
+        # op_func = _conv2d_forward_kernel so the VJP rule can propagate
+        # gradients back to x (input) and self.W (filter weights).
+        # op_kwargs stores everything the backward pass needs to reconstruct
+        # x_padded and compute dx/dW via the col2im scatter-add.
+        y = Tensor(
+            y_data,
+            parents=[x, self.W],
+            op_func=_conv2d_forward_kernel,
+            op_kwargs={
+                "pad_h": pad_h,
+                "pad_w": pad_w,
+                "stride_h": stride_h,
+                "stride_w": stride_w,
+                "H_out": H_out,
+                "W_out": W_out,
+            },
+            name="Conv2d_forward",
+        )
 
         if self.use_bias:
             bias_reshaped = self.b.reshape(1, out_channels, 1, 1)
@@ -487,8 +504,9 @@ class Embedding(Module):
 
     def forward(self, x_idx):
         x_np = as_numpy(x_idx.data if isinstance(x_idx, Tensor) else x_idx).astype(int)
-        one_hot = np.eye(self.num_embeddings)[x_np]
-        return self.lin(Tensor(one_hot))
+        one_hot = np.eye(self.num_embeddings, dtype=np.float32)[x_np]
+        # Inherit device from embedding weight so GPU models stay on GPU
+        return self.lin(Tensor(one_hot, device=self.lin.W.device))
 
 
 # ============================================================================
@@ -541,7 +559,10 @@ class ScaledDotProductAttention(Module):
         key_T = ops.transpose(key, axes=tuple(axes))
 
         scores = query @ key_T
-        scores = scores * Tensor(np.array([self.scale]))  # float64 scalar
+        # Keep the scale scalar on the same device as the query (CPU or GPU)
+        scores = scores * Tensor(
+            np.array([self.scale], dtype=np.float32), device=query.device
+        )
 
         if mask is not None:
             scores = scores + mask

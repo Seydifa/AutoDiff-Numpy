@@ -238,6 +238,89 @@ def conv2d_full(g, w):
 
 
 # ---------------------------------------------------------------------------
+# Backward pass for the vectorised im2col convolution used by the Conv2d layer
+# ---------------------------------------------------------------------------
+
+
+def _vjp_conv2d_forward_kernel(
+    g, x_unpad, W, pad_h=0, pad_w=0, stride_h=1, stride_w=1, H_out=1, W_out=1
+):
+    """
+    VJP for _conv2d_forward_kernel(x_padded, W, stride_h, stride_w, H_out, W_out).
+
+    Parameters
+    ----------
+    g        : (batch, out_ch, H_out, W_out)  upstream gradient
+    x_unpad  : (batch, in_ch, H, W)           original unpadded input
+    W        : (out_ch, in_ch, kH, kW)        filter weights
+    pad_h, pad_w, stride_h, stride_w, H_out, W_out  : stored in op_kwargs
+
+    Returns
+    -------
+    dx  : same shape as x_unpad
+    dW  : same shape as W
+    """
+    xp = get_xp(g)
+    batch = x_unpad.shape[0]
+    out_ch, in_ch, kH, kW = W.shape
+
+    # 1. Reconstruct the padded input
+    if pad_h > 0 or pad_w > 0:
+        x_padded = xp.pad(x_unpad, ((0, 0), (0, 0), (pad_h, pad_h), (pad_w, pad_w)))
+    else:
+        x_padded = x_unpad
+
+    # 2. Im2col: (batch, in_ch*kH*kW, H_out*W_out)
+    s = x_padded.strides
+    col_shape = (batch, in_ch, kH, kW, H_out, W_out)
+    col_strides = (s[0], s[1], s[2], s[3], stride_h * s[2], stride_w * s[3])
+    cols = xp.lib.stride_tricks.as_strided(
+        x_padded, shape=col_shape, strides=col_strides
+    )
+    cols_2d = xp.ascontiguousarray(cols).reshape(
+        batch, in_ch * kH * kW, H_out * W_out
+    )  # (B, K, N)  where K=in_ch*kH*kW, N=H_out*W_out
+
+    # 3. Reshape upstream gradient
+    g_2d = g.reshape(batch, out_ch, H_out * W_out)  # (B, C_out, N)
+    W_2d = W.reshape(out_ch, in_ch * kH * kW)  # (C_out, K)
+
+    # 4. Gradient w.r.t. W
+    # dW_2d[c, k] = sum_{b, n} g_2d[b, c, n] * cols_2d[b, k, n]
+    # = (g_2d @ cols_2d^T).sum(batch)  shape: (C_out, K)
+    dW_2d = xp.matmul(g_2d, cols_2d.transpose(0, 2, 1)).sum(axis=0)
+    dW = dW_2d.reshape(W.shape)  # (C_out, C_in, kH, kW)
+
+    # 5. Gradient w.r.t. cols_2d via W^T @ g
+    # dcols_2d[b, k, n] = sum_{c} W_2d[c, k] * g_2d[b, c, n]
+    # Vectorised: (1, K, C_out) @ (B, C_out, N) → (B, K, N)
+    dcols_2d = xp.matmul(
+        W_2d.T[None],  # broadcast over batch: (1, K, C_out)
+        g_2d,  # (B, C_out, N)
+    )  # → (B, K, N)
+
+    # 6. col2im: scatter-add dcols back to dx_padded
+    dcols = dcols_2d.reshape(batch, in_ch, kH, kW, H_out, W_out)
+    dx_padded = xp.zeros_like(x_padded)
+    for dh in range(kH):
+        for dw in range(kW):
+            dx_padded[
+                :,
+                :,
+                dh : dh + H_out * stride_h : stride_h,
+                dw : dw + W_out * stride_w : stride_w,
+            ] += dcols[:, :, dh, dw, :, :]
+
+    # 7. Strip padding to recover dx with same shape as x_unpad
+    if pad_h > 0 or pad_w > 0:
+        dx = dx_padded[:, :, pad_h:-pad_h, pad_w:-pad_w]
+    else:
+        dx = dx_padded
+
+    return dx, dW
+
+
+# ---------------------------------------------------------------------------
 # VJP helpers — named functions that compute each activation once, then reuse
 # the cached result for both the output value and the gradient multiplier.
 # ---------------------------------------------------------------------------
@@ -368,7 +451,12 @@ VJP_RULES = {
     ),
     # Shape operations — _reshape is populated after the dict (see below).
     np.transpose: lambda g, x, axes=None: (
-        get_xp(g).transpose(g, get_xp(g).argsort(axes)) if axes is not None else g.T,
+        # np.argsort is used intentionally — axes is always a tiny Python list/tuple,
+        # and cp.argsort(tuple) fails on some CuPy versions.  The result is passed
+        # back as a plain list so both NumPy and CuPy accept it for transpose.
+        get_xp(g).transpose(g, np.argsort(list(axes)).tolist())
+        if axes is not None
+        else g.T,
     ),
     np.expand_dims: lambda g, x, axis: (get_xp(g).squeeze(g, axis),),
     np.squeeze: lambda g, x, axis=None: (
@@ -408,10 +496,14 @@ VJP_RULES = {
         _avg_pool2d_backward(g, x, kernel_size, stride, padding),
     ),
     dropout: lambda g, x, p=0.5, training=True: (g / (1 - p),) if training else (g,),
-    batch_norm: lambda g, x, weight, bias, mean, var, eps=1e-5: (
-        _batch_norm_backward(g, x, weight, bias, mean, var, eps),
+    batch_norm: lambda g, x, weight, bias, mean, var, eps=1e-5: _batch_norm_backward(
+        g, x, weight, bias, mean, var, eps
     ),
 }
+
+# Register the im2col conv VJP after the dict so that _conv2d_forward_kernel
+# (defined at the top of this module) can be used as the dict key.
+VJP_RULES[_conv2d_forward_kernel] = _vjp_conv2d_forward_kernel
 
 # ---------------------------------------------------------------------------
 # _reshape: NumPy-version-safe wrapper for np.reshape
@@ -530,4 +622,8 @@ def _batch_norm_backward(g, x, weight, bias, mean, var, eps=1e-5):
         - (grad_x_norm * x_norm) * (1 / (var + eps)) * (x - mean) / N
         - xp.mean(grad_x_norm, axis=0, keepdims=True) / xp.sqrt(var + eps)
     )
-    return grad_x
+    # Gradients for the affine parameters γ (weight) and β (bias)
+    # Sum over all dimensions that were broadcast-expanded relative to weight/bias shape
+    grad_weight = unbroadcast(g * x_norm, weight.shape)
+    grad_bias = unbroadcast(g, bias.shape)
+    return grad_x, grad_weight, grad_bias
