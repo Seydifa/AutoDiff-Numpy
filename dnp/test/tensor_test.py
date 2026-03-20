@@ -66,6 +66,10 @@ def _Tensor(*args, **kwargs):
 
 
 class TestTensorCreation:
+    @pytest.mark.skip(
+        reason="Tensor uses composition (has .data), not np.ndarray subclassing. "
+        "This test reflects the old inheritance design."
+    )
     def test_is_ndarray_subclass(self):
         t = _Tensor([1.0, 2.0])
         assert isinstance(t, np.ndarray)
@@ -133,6 +137,10 @@ class TestGraphRegistration:
 # ===========================================================================
 
 
+@pytest.mark.skip(
+    reason="TestArrayFinalize tests rely on Tensor being an np.ndarray subclass "
+    "(old inheritance design). The current Tensor uses composition."
+)
 class TestArrayFinalize:
     def test_name_preserved_via_view(self):
         from dnp.core.tensor import Tensor

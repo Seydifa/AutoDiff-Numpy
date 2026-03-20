@@ -45,7 +45,8 @@ class TestAddNode:
         sg = SessionGraph()
         node = MockNode("x")
         nid = sg.add_node(node)
-        assert sg.G.nodes[nid]["obj"] is node
+        # The lightweight store keeps the display name; the nx graph is built on-demand.
+        assert sg._nodes[nid] == node.name
 
     def test_counter_increments(self):
         sg = SessionGraph()

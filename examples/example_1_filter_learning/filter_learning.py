@@ -119,6 +119,20 @@ def main():
         W_learned.grad.fill(0.0)
         loss.backward()
 
+        # Capture the computation graph at epoch 0, before the parameter
+        # is recreated (which would add a disconnected node to the session).
+        if epoch == 0:
+            out_path = (
+                Path(__file__).parent.parent.parent
+                / "figures"
+                / "example_1_filter_learning"
+                / "computation_graph.png"
+            )
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            session.show_graphe(
+                title="Filter Learning Graph", save=True, filename=str(out_path)
+            )
+
         # --- Gradient Update (SGD) ---
         # Update the underlying data directly
         updated_data = np.asarray(W_learned) - learning_rate * W_learned.grad
@@ -128,11 +142,6 @@ def main():
 
         if (epoch + 1) % 50 == 0:
             print(f"  Epoch {epoch + 1:3d}/{epochs} | Loss: {loss.item():.6f}")
-
-        if epoch == 0:
-            out_path = Path(__file__).parent.parent.parent / "figures" / "example_1_filter_learning" / "computation_graph.png"
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            session.show_graphe(title="Filter Learning Graph", save=True, filename=str(out_path))
 
     session.reset()
     final_pred = convolve2d(X_img, W_learned.data, mode="valid")

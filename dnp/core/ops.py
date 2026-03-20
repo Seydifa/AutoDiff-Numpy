@@ -34,6 +34,7 @@ from .vjp_rules import (
     avg_pool2d,
     dropout,
     batch_norm,
+    _reshape,
 )
 
 
@@ -47,22 +48,30 @@ class Ops:
 
     def __call__(self, *args, **kwargs):
         from .tensor import Tensor
-        
+
         # Extract raw data
         args_data = [a.data if isinstance(a, Tensor) else a for a in args]
-        kwargs_data = {k: (v.data if isinstance(v, Tensor) else v) for k, v in kwargs.items()}
-        
+        kwargs_data = {
+            k: (v.data if isinstance(v, Tensor) else v) for k, v in kwargs.items()
+        }
+
         out_data = self.func(*args_data, **kwargs_data)
-        
+
         parents = [a for a in args if isinstance(a, Tensor)]
         parents.extend([v for v in kwargs.values() if isinstance(v, Tensor)])
-        
+
         op_kwargs = {k: v for k, v in kwargs.items() if not isinstance(v, Tensor)}
-        
+
         if not parents:
             return out_data
-            
-        return Tensor(out_data, parents=parents, op_func=self.func, op_kwargs=op_kwargs, name=self.name)
+
+        return Tensor(
+            out_data,
+            parents=parents,
+            op_func=self.func,
+            op_kwargs=op_kwargs,
+            name=self.name,
+        )
 
     def vpj(self, *args, **kwargs):
         return self.vpj_fun(*args, **kwargs)
@@ -122,7 +131,7 @@ min = Ops(np.min, VJP_RULES[np.min], name="min")
 # ---------------------------------------------------------------------------
 # Shape operations
 # ---------------------------------------------------------------------------
-reshape = Ops(np.reshape, VJP_RULES[np.reshape], name="reshape")
+reshape = Ops(_reshape, VJP_RULES[_reshape], name="reshape")
 transpose = Ops(np.transpose, VJP_RULES[np.transpose], name="transpose")
 expand_dims = Ops(np.expand_dims, VJP_RULES[np.expand_dims], name="expand_dims")
 squeeze = Ops(np.squeeze, VJP_RULES[np.squeeze], name="squeeze")

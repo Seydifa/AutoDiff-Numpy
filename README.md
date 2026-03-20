@@ -134,6 +134,102 @@ Execute tests using `pytest` inside the root or `/dnp/test` directory to ensure 
 pytest dnp/test/
 ```
 
+## ⚡ CUDA / GPU Acceleration
+
+DifferentialNumpy transparently supports GPU execution via [CuPy](https://cupy.dev/) — a drop-in NumPy replacement that runs on NVIDIA CUDA GPUs. When CuPy is detected at import time the backend switches automatically; no code changes are required to your model or training loop.
+
+### Installation
+
+Install CuPy for your CUDA version (check yours with `nvcc --version` or `nvidia-smi`):
+
+```bash
+# CUDA 12.x
+pip install cupy-cuda12x
+
+# CUDA 11.x
+pip install cupy-cuda11x
+```
+
+Full install guide: <https://docs.cupy.dev/en/stable/install.html>
+
+### Moving tensors to GPU
+
+```python
+from dnp.core.tensor import Tensor
+import numpy as np
+
+# Option 1 — create directly on GPU
+x = Tensor(np.random.randn(32, 64), device="cuda")
+
+# Option 2 — move an existing tensor
+x = Tensor(np.random.randn(32, 64))
+x = x.cuda()       # → GPU
+x = x.cpu()        # → CPU
+x = x.to("cuda")   # alternatively
+```
+
+### Device-aware training loop
+
+Weights, biases and optimizer state are automatically allocated on the correct device — no manual `.to(device)` calls needed on model parameters:
+
+```python
+import dnp
+import numpy as np
+from dnp.core.tensor import Tensor
+from dnp.core.session import session
+from dnp.layers import Sequential, Linear
+from dnp.core.optimizers import Adam
+
+model = Sequential(Linear(64, 32), Linear(32, 10))
+
+# Move all parameters to GPU
+for p in model.parameters():
+    p.cuda()
+
+optimizer = Adam(model.parameters(), lr=0.001)
+
+for epoch in range(100):
+    session.reset()
+    optimizer.zero_grad()
+
+    X = Tensor(np.random.randn(16, 64), device="cuda")
+    pred = model(X)
+    loss = dnp.ops.mean(dnp.ops.square(pred))
+
+    loss.backward()
+    optimizer.step()
+```
+
+### Global dtype control
+
+Use `dnp.set_dtype` to switch all new Tensors to a lower-precision dtype, which can halve memory usage and improve throughput on GPU:
+
+```python
+import dnp
+
+dnp.set_dtype('float32')   # new Tensors default to float32
+dnp.set_dtype('float16')   # for maximum GPU throughput (less stable)
+dnp.set_dtype('float64')   # revert to default (highest precision)
+
+# Query the current setting
+print(dnp.get_dtype())     # e.g. <class 'numpy.float32'>
+```
+
+`set_dtype` can also be accessed as `dnp.core.backend.set_dtype(...)`.
+
+### Backend utilities
+
+```python
+from dnp.core import backend
+
+backend.is_cuda_available      # True if CuPy is importable
+backend.get_device_count()     # number of CUDA GPUs
+backend.synchronize()          # block until all GPU kernels finish (useful for timing)
+backend.as_numpy(array)        # transfer GPU array → CPU numpy
+backend.as_cupy(array)         # transfer CPU array → GPU
+backend.to_device(array, "cuda")  # generic transfer
+```
+
 ## 🎓 Educational Focus: Understanding Automatic Differentiation
 
 We strongly believe in learning by doing. The core of any backpropagation engine relies on Vector-Jacobian Products (VJPs) to correctly route derivatives dynamically.

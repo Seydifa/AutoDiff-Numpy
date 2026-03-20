@@ -9,135 +9,109 @@ This is the single source of truth — previously split across dnp/ops/vjp_rules
 
 # Third-party libraries
 import numpy as np
-import numba
 
 from .backend import get_xp, as_numpy
 
 EPSILON = 1e-8
 
+# Precomputed constant for GELU — avoids recomputing sqrt on every call.
+_GELU_COEFF = float(np.sqrt(2.0 / np.pi))  # ≈ 0.7978845608028654
+
 # ---------------------------------------------------------------------------
-# Numba-optimized Kernels (CPU bound, so input needs to be transferred)
+# Vectorized kernels (CPU & GPU compatible via get_xp)
 # ---------------------------------------------------------------------------
 
-@numba.njit(cache=True)
-def _max_pool2d_backward_kernel(g, x_padded, kH, kW, sH, sW, H_out, W_out):
-    batch, channels, _, _ = x_padded.shape
-    grad_x = np.zeros_like(x_padded)
-    for b in range(batch):
-        for c in range(channels):
-            for i in range(H_out):
-                for j in range(W_out):
-                    h_start = i * sH
-                    h_end = h_start + kH
-                    w_start = j * sW
-                    w_end = w_start + kW
-                    
-                    max_val = -1e30 
-                    for wh in range(h_start, h_end):
-                        for ww in range(w_start, w_end):
-                            if x_padded[b, c, wh, ww] > max_val:
-                                max_val = x_padded[b, c, wh, ww]
-                    
-                    for wh in range(h_start, h_end):
-                        for ww in range(w_start, w_end):
-                            if x_padded[b, c, wh, ww] == max_val:
-                                grad_x[b, c, wh, ww] += g[b, c, i, j]
-    return grad_x
 
-
-@numba.njit(cache=True)
-def _avg_pool2d_backward_kernel(g, x_padded, kH, kW, sH, sW, H_out, W_out):
-    batch, channels, _, _ = x_padded.shape
-    grad_x = np.zeros_like(x_padded)
-    pool_size = kH * kW
-    for b in range(batch):
-        for c in range(channels):
-            for i in range(H_out):
-                for j in range(W_out):
-                    h_start = i * sH
-                    h_end = h_start + kH
-                    w_start = j * sW
-                    w_end = w_start + kW
-                    
-                    val = g[b, c, i, j] / pool_size
-                    for wh in range(h_start, h_end):
-                        for ww in range(w_start, w_end):
-                            grad_x[b, c, wh, ww] += val
-    return grad_x
-
-
-@numba.njit(cache=True)
 def _conv2d_forward_kernel(x_padded, W, stride_h, stride_w, H_out, W_out):
-    batch_size, in_channels, _, _ = x_padded.shape
-    out_channels, _, kH, kW = W.shape
-    y = np.zeros((batch_size, out_channels, H_out, W_out), dtype=x_padded.dtype)
-    
-    for b in range(batch_size):
-        for oc in range(out_channels):
-            for ic in range(in_channels):
-                for i in range(H_out):
-                    h_start = i * stride_h
-                    for j in range(W_out):
-                        w_start = j * stride_w
-                        
-                        sum_val = 0.0
-                        for kh in range(kH):
-                            for kw in range(kW):
-                                sum_val += x_padded[b, ic, h_start + kh, w_start + kw] * W[oc, ic, kh, kw]
-                        y[b, oc, i, j] += sum_val
-    return y
+    """Im2col + batched matmul convolution — O(B·Cout·Cin·kH·kW·Hout·Wout).
+
+    Replaces the old 6-level Numba loop with a fully vectorized path that
+    works transparently on both NumPy (CPU) and CuPy (GPU) arrays.
+    """
+    xp = get_xp(x_padded)
+    batch, in_ch, _, _ = x_padded.shape
+    out_ch, _, kH, kW = W.shape
+
+    # Build a strided patch view: (batch, in_ch, kH, kW, H_out, W_out)
+    # No data is copied — this is a zero-cost view of x_padded.
+    s = x_padded.strides
+    col_shape = (batch, in_ch, kH, kW, H_out, W_out)
+    col_strides = (s[0], s[1], s[2], s[3], stride_h * s[2], stride_w * s[3])
+    cols = xp.lib.stride_tricks.as_strided(
+        x_padded, shape=col_shape, strides=col_strides
+    )
+
+    # Reshape to 2-D for a single batched matmul.
+    # ascontiguousarray ensures the overlapping view can be reshaped safely.
+    cols_2d = xp.ascontiguousarray(cols).reshape(batch, in_ch * kH * kW, H_out * W_out)
+    W_2d = W.reshape(out_ch, in_ch * kH * kW)
+    return xp.matmul(W_2d, cols_2d).reshape(batch, out_ch, H_out, W_out)
 
 
 # ---------------------------------------------------------------------------
 # Broadcasting utility
 # ---------------------------------------------------------------------------
 
+
 def unbroadcast(grad, target_shape):
     """Sum gradient axes that were broadcast-expanded, restoring target_shape."""
     if grad.shape == target_shape:
         return grad
+    # Collapse all extra leading dims in one fused reduction.
     ndims_added = grad.ndim - len(target_shape)
-    for _ in range(ndims_added):
-        grad = grad.sum(axis=0)
-    for i, dim in enumerate(target_shape):
-        if dim == 1 and grad.shape[i] > 1:
-            grad = grad.sum(axis=i, keepdims=True)
+    if ndims_added > 0:
+        grad = grad.sum(axis=tuple(range(ndims_added)))
+    # Collapse all broadcast dims in one fused reduction (keepdims preserves rank).
+    axes = tuple(
+        i for i, dim in enumerate(target_shape) if dim == 1 and grad.shape[i] > 1
+    )
+    if axes:
+        grad = grad.sum(axis=axes, keepdims=True)
     return grad
+
 
 # ---------------------------------------------------------------------------
 # Activation / helper functions (also serve as forward-pass callables)
 # ---------------------------------------------------------------------------
+
 
 def sigmoid(x):
     xp = get_xp(x)
     x_clipped = xp.clip(x, -500, 500)
     return 1.0 / (1.0 + xp.exp(-x_clipped))
 
+
 def relu(x):
     xp = get_xp(x)
     return xp.maximum(0.0, x)
+
 
 def leaky_relu(x, alpha=0.01):
     xp = get_xp(x)
     return xp.where(x > 0, x, alpha * x)
 
+
 def elu(x, alpha=1.0):
     xp = get_xp(x)
     return xp.where(x > 0, x, alpha * (xp.exp(x) - 1.0))
 
+
 def softplus(x):
     xp = get_xp(x)
-    x_clipped = xp.clip(x, -500, 500)
-    return xp.log(1.0 + xp.exp(x_clipped))
+    # logaddexp(0, x) = log(1 + exp(x)) computed in a numerically stable way;
+    # avoids manual clipping, one fewer intermediate array.
+    return xp.logaddexp(0.0, x)
+
 
 def swish(x):
     return x * sigmoid(x)
 
+
 def gelu(x):
     xp = get_xp(x)
-    const1 = xp.sqrt(2.0 / xp.pi)
-    const2 = 0.044715
-    return 0.5 * x * (1.0 + xp.tanh(const1 * (x + const2 * xp.power(x, 3))))
+    # Use module-level constant (no sqrt per call) and ** instead of xp.power.
+    return 0.5 * x * (1.0 + xp.tanh(_GELU_COEFF * (x + 0.044715 * x**3)))
+
 
 def softmax(x, axis=-1):
     xp = get_xp(x)
@@ -145,78 +119,75 @@ def softmax(x, axis=-1):
     e_x = xp.exp(x - x_max)
     return e_x / xp.sum(e_x, axis=axis, keepdims=True)
 
+
 # ---------------------------------------------------------------------------
 # Pooling operations (vectorized fallback or cpu bound logic where necessary)
 # ---------------------------------------------------------------------------
 
+
 def max_pool2d(x, kernel_size, stride=1, padding=0):
     xp = get_xp(x)
-    is_cupy = (xp.__name__ == 'cupy')
-    if is_cupy:
-        x_np = as_numpy(x)
-    else:
-        x_np = x
 
     if isinstance(kernel_size, int):
         kernel_size = (kernel_size, kernel_size)
     if isinstance(stride, int):
         stride = (stride, stride)
 
-    batch, channels, H, W = x_np.shape
+    if padding > 0:
+        x = xp.pad(x, ((0, 0), (0, 0), (padding, padding), (padding, padding)))
+
+    batch, channels, H, W = x.shape
     kH, kW = kernel_size
     sH, sW = stride
-
-    if padding > 0:
-        x_np = np.pad(x_np, ((0, 0), (0, 0), (padding, padding), (padding, padding)))
-        H, W = x_np.shape[2:]
-
     H_out = (H - kH) // sH + 1
     W_out = (W - kW) // sW + 1
 
-    strides = x_np.strides
+    strides = x.strides
     shape = (batch, channels, H_out, W_out, kH, kW)
-    strides = (strides[0], strides[1], sH * strides[2], sW * strides[3], strides[2], strides[3])
+    strides = (
+        strides[0],
+        strides[1],
+        sH * strides[2],
+        sW * strides[3],
+        strides[2],
+        strides[3],
+    )
 
-    x_windowed = np.lib.stride_tricks.as_strided(x_np, shape=shape, strides=strides)
-    out = np.max(x_windowed, axis=(4, 5))
+    x_windowed = xp.lib.stride_tricks.as_strided(x, shape=shape, strides=strides)
+    return xp.max(x_windowed, axis=(4, 5))
 
-    if is_cupy:
-        return xp.asarray(out)
-    return out
 
 def avg_pool2d(x, kernel_size, stride=1, padding=0):
     xp = get_xp(x)
-    is_cupy = (xp.__name__ == 'cupy')
-    if is_cupy:
-        x_np = as_numpy(x)
-    else:
-        x_np = x
 
     if isinstance(kernel_size, int):
         kernel_size = (kernel_size, kernel_size)
     if isinstance(stride, int):
         stride = (stride, stride)
 
-    batch, channels, H, W = x_np.shape
+    if padding > 0:
+        x = xp.pad(x, ((0, 0), (0, 0), (padding, padding), (padding, padding)))
+
+    batch, channels, H, W = x.shape
     kH, kW = kernel_size
     sH, sW = stride
-
-    if padding > 0:
-        x_np = np.pad(x_np, ((0, 0), (0, 0), (padding, padding), (padding, padding)))
-        H, W = x_np.shape[2:]
-
     H_out = (H - kH) // sH + 1
     W_out = (W - kW) // sW + 1
 
-    strides = x_np.strides
+    strides = x.strides
     shape = (batch, channels, H_out, W_out, kH, kW)
-    strides = (strides[0], strides[1], sH * strides[2], sW * strides[3], strides[2], strides[3])
+    strides = (
+        strides[0],
+        strides[1],
+        sH * strides[2],
+        sW * strides[3],
+        strides[2],
+        strides[3],
+    )
 
-    x_windowed = np.lib.stride_tricks.as_strided(x_np, shape=shape, strides=strides)
-    out = np.mean(x_windowed, axis=(4, 5))
-    if is_cupy:
-        return xp.asarray(out)
-    return out
+    x_windowed = xp.lib.stride_tricks.as_strided(x, shape=shape, strides=strides)
+    return xp.mean(x_windowed, axis=(4, 5))
+
 
 def dropout(x, p=0.5, training=True):
     if not training or p == 0:
@@ -225,37 +196,77 @@ def dropout(x, p=0.5, training=True):
     mask = xp.random.binomial(1, 1 - p, size=x.shape)
     return x * mask / (1 - p)
 
+
 def batch_norm(x, weight, bias, mean, var, eps=1e-5):
     xp = get_xp(x)
     x_norm = (x - mean) / xp.sqrt(var + eps)
     return weight * x_norm + bias
 
+
 # ---------------------------------------------------------------------------
 # Convolution helpers
 # ---------------------------------------------------------------------------
 
+
 def conv2d(x, w, mode="valid"):
     """2D convolution using scipy/cupyx."""
     xp = get_xp(x)
-    if xp.__name__ == 'cupy':
+    if xp.__name__ == "cupy":
         # Fallback to scipy or cupyx if available
         try:
             from cupyx.scipy.signal import convolve2d as cp_convolve2d
+
             return cp_convolve2d(x, w, mode=mode)
         except ImportError:
             from scipy.signal import convolve2d as sp_convolve2d
+
             res = sp_convolve2d(as_numpy(x), as_numpy(w), mode=mode)
             return xp.asarray(res)
     else:
         from scipy.signal import convolve2d as sp_convolve2d
+
         return sp_convolve2d(x, w, mode=mode)
+
 
 def rot180(w):
     xp = get_xp(w)
     return xp.rot90(w, 2)
 
+
 def conv2d_full(g, w):
     return conv2d(g, w, mode="full")
+
+
+# ---------------------------------------------------------------------------
+# VJP helpers — named functions that compute each activation once, then reuse
+# the cached result for both the output value and the gradient multiplier.
+# ---------------------------------------------------------------------------
+
+
+def _vjp_sigmoid(g, x):
+    s = sigmoid(x)
+    return (g * s * (1.0 - s),)
+
+
+def _vjp_swish(g, x):
+    s = sigmoid(x)
+    sw = x * s
+    return (g * (sw + s * (1.0 - sw)),)
+
+
+def _vjp_gelu(g, x):
+    xp = get_xp(x)
+    inner = _GELU_COEFF * (x + 0.044715 * x**3)
+    t = xp.tanh(inner)  # computed once, reused twice
+    dcdf = _GELU_COEFF * (1.0 + 3.0 * 0.044715 * x**2)
+    return (g * (0.5 * (1.0 + t) + 0.5 * x * (1.0 - t**2) * dcdf),)
+
+
+def _vjp_softmax(g, x):
+    xp = get_xp(x)
+    s = softmax(x)  # computed once, reused twice
+    return (s * (g - xp.sum(g * s, axis=-1, keepdims=True)),)
+
 
 # ---------------------------------------------------------------------------
 # VJP Rules dictionary
@@ -307,8 +318,18 @@ VJP_RULES = {
     np.round: lambda g, x: (get_xp(x).zeros_like(x),),
     # Matrix operations
     np.matmul: lambda g, x, y: (
-        unbroadcast(get_xp(g).matmul(g, get_xp(y).swapaxes(y, -1, -2) if getattr(y, 'ndim', 0) >= 2 else y), x.shape),
-        unbroadcast(get_xp(g).matmul(get_xp(x).swapaxes(x, -1, -2) if getattr(x, 'ndim', 0) >= 2 else x, g), y.shape),
+        unbroadcast(
+            get_xp(g).matmul(
+                g, get_xp(y).swapaxes(y, -1, -2) if getattr(y, "ndim", 0) >= 2 else y
+            ),
+            x.shape,
+        ),
+        unbroadcast(
+            get_xp(g).matmul(
+                get_xp(x).swapaxes(x, -1, -2) if getattr(x, "ndim", 0) >= 2 else x, g
+            ),
+            y.shape,
+        ),
     ),
     np.dot: lambda g, x, y: (get_xp(g).dot(g, y.T), get_xp(g).dot(x.T, g)),
     # Reductions
@@ -318,10 +339,20 @@ VJP_RULES = {
     ),
     np.mean: lambda g, x, axis=None, keepdims=False: (
         (
-            (g if keepdims else get_xp(g).expand_dims(g, axis) if axis is not None else g)
+            (
+                g
+                if keepdims
+                else get_xp(g).expand_dims(g, axis)
+                if axis is not None
+                else g
+            )
             * get_xp(x).ones_like(x)
         )
-        / (get_xp(x).prod(get_xp(x).array(x.shape)[axis]) if axis is not None else x.size),
+        / (
+            get_xp(x).prod(get_xp(x).array(x.shape)[axis])
+            if axis is not None
+            else x.size
+        ),
     ),
     np.prod: lambda g, x, axis=None, keepdims=False: (
         (g if keepdims else get_xp(g).expand_dims(g, axis) if axis is not None else g)
@@ -335,112 +366,159 @@ VJP_RULES = {
         (g if keepdims else get_xp(g).expand_dims(g, axis) if axis is not None else g)
         * (x == get_xp(x).min(x, axis=axis, keepdims=True)),
     ),
-    # Shape operations
-    np.reshape: lambda g, x, newshape: (get_xp(g).reshape(g, x.shape),),
+    # Shape operations — _reshape is populated after the dict (see below).
     np.transpose: lambda g, x, axes=None: (
         get_xp(g).transpose(g, get_xp(g).argsort(axes)) if axes is not None else g.T,
     ),
     np.expand_dims: lambda g, x, axis: (get_xp(g).squeeze(g, axis),),
     np.squeeze: lambda g, x, axis=None: (
-        get_xp(g).expand_dims(g, axis) if axis is not None else get_xp(g).reshape(g, x.shape),
+        get_xp(g).expand_dims(g, axis)
+        if axis is not None
+        else get_xp(g).reshape(g, x.shape),
     ),
     # NN ops
     conv2d: lambda g, x, w, mode="valid": (
-        conv2d(g, rot180(w), mode="full" if mode == "valid" else "same" if mode == "same" else "valid"),
         conv2d(
-            x if mode == "valid" else
-            get_xp(x).pad(x, [(w.shape[0] // 2,) * 2, (w.shape[1] // 2,) * 2]) if mode == "same" else
-            get_xp(x).pad(x, [(w.shape[0] - 1,) * 2, (w.shape[1] - 1,) * 2]),
-            g, mode="valid"
+            g,
+            rot180(w),
+            mode="full" if mode == "valid" else "same" if mode == "same" else "valid",
+        ),
+        conv2d(
+            x
+            if mode == "valid"
+            else get_xp(x).pad(x, [(w.shape[0] // 2,) * 2, (w.shape[1] // 2,) * 2])
+            if mode == "same"
+            else get_xp(x).pad(x, [(w.shape[0] - 1,) * 2, (w.shape[1] - 1,) * 2]),
+            g,
+            mode="valid",
         ),
     ),
-    sigmoid: lambda g, x: (g * sigmoid(x) * (1.0 - sigmoid(x)),),
+    sigmoid: _vjp_sigmoid,
     relu: lambda g, x: (g * (x > 0).astype(x.dtype),),
     leaky_relu: lambda g, x: (g * get_xp(x).where(x > 0, 1.0, 0.01),),
     elu: lambda g, x: (g * get_xp(x).where(x > 0, 1.0, 1.0 * get_xp(x).exp(x)),),
     softplus: lambda g, x: (g * sigmoid(x),),
-    swish: lambda g, x: (g * (swish(x) + sigmoid(x) * (1.0 - swish(x))),),
-    gelu: lambda g, x: (
-        g * (
-            0.5 * (1.0 + get_xp(x).tanh(get_xp(x).sqrt(2 / get_xp(x).pi) * (x + 0.044715 * x**3)))
-            + 0.5 * x * (1.0 - get_xp(x).tanh(get_xp(x).sqrt(2 / get_xp(x).pi) * (x + 0.044715 * x**3)) ** 2)
-            * get_xp(x).sqrt(2 / get_xp(x).pi) * (1.0 + 3 * 0.044715 * x**2)
-        ),
+    swish: _vjp_swish,
+    gelu: _vjp_gelu,
+    softmax: _vjp_softmax,
+    max_pool2d: lambda g, x, kernel_size, stride=1, padding=0: (
+        _max_pool2d_backward(g, x, kernel_size, stride, padding),
     ),
-    softmax: lambda g, x: (g * softmax(x) - softmax(x) * get_xp(x).sum(g * softmax(x), axis=-1, keepdims=True),),
-    max_pool2d: lambda g, x, kernel_size, stride=1, padding=0: (_max_pool2d_backward(g, x, kernel_size, stride, padding),),
-    avg_pool2d: lambda g, x, kernel_size, stride=1, padding=0: (_avg_pool2d_backward(g, x, kernel_size, stride, padding),),
-    dropout: lambda g, x, p=0.5, training=True: ((g / (1 - p),) if training else (g,)),
-    batch_norm: lambda g, x, weight, bias, mean, var, eps=1e-5: (_batch_norm_backward(g, x, weight, bias, mean, var, eps),),
+    avg_pool2d: lambda g, x, kernel_size, stride=1, padding=0: (
+        _avg_pool2d_backward(g, x, kernel_size, stride, padding),
+    ),
+    dropout: lambda g, x, p=0.5, training=True: (g / (1 - p),) if training else (g,),
+    batch_norm: lambda g, x, weight, bias, mean, var, eps=1e-5: (
+        _batch_norm_backward(g, x, weight, bias, mean, var, eps),
+    ),
 }
+
+# ---------------------------------------------------------------------------
+# _reshape: NumPy-version-safe wrapper for np.reshape
+# ---------------------------------------------------------------------------
+# NumPy 2.0 renamed the `newshape` keyword argument to `shape`.  Passing the
+# new shape *positionally* works on every NumPy version, so we wrap it here.
+
+
+def _reshape(a, newshape):
+    """NumPy-version-agnostic reshape (passes newshape positionally)."""
+    return np.reshape(a, newshape)
+
+
+# Register VJP rule after both the dict AND _reshape are defined.
+VJP_RULES[_reshape] = lambda g, x, newshape: (get_xp(g).reshape(g, x.shape),)
+# Keep the np.reshape key as an alias so existing code that looks up
+# VJP_RULES[np.reshape] directly still works.
+VJP_RULES[np.reshape] = VJP_RULES[_reshape]
+
 
 # ---------------------------------------------------------------------------
 # Backward pass helpers
 # ---------------------------------------------------------------------------
 
-def _max_pool2d_backward(g, x, kernel_size, stride=1, padding=0):
-    xp = get_xp(x)
-    is_cpu = (xp.__name__ == 'numpy')
-    g_np, x_np = as_numpy(g), as_numpy(x)
 
+def _max_pool2d_backward(g, x, kernel_size, stride=1, padding=0):
+    """Vectorized max-pool backward via strided mask + kH*kW scatter-adds.
+
+    Each of the kH*kW iterations is a fully vectorized operation over
+    (batch, channels, H_out, W_out) — no Python loops over spatial dims.
+    Works on both NumPy (CPU) and CuPy (GPU) without any data transfer.
+    """
+    xp = get_xp(x)
     if isinstance(kernel_size, int):
         kernel_size = (kernel_size, kernel_size)
     if isinstance(stride, int):
         stride = (stride, stride)
-
-    batch, channels, H, W = x_np.shape
     kH, kW = kernel_size
     sH, sW = stride
 
     if padding > 0:
-        x_padded = np.pad(x_np, ((0, 0), (0, 0), (padding, padding), (padding, padding)))
-    else:
-        x_padded = x_np
+        x = xp.pad(x, ((0, 0), (0, 0), (padding, padding), (padding, padding)))
 
-    H_padded, W_padded = x_padded.shape[2:]
-    H_out = (H_padded - kH) // sH + 1
-    W_out = (W_padded - kW) // sW + 1
+    batch, channels, H_pad, W_pad = x.shape
+    H_out = (H_pad - kH) // sH + 1
+    W_out = (W_pad - kW) // sW + 1
 
-    grad_x_padded = _max_pool2d_backward_kernel(g_np, x_padded, kH, kW, sH, sW, H_out, W_out)
+    # Zero-copy strided view: (B, C, H_out, W_out, kH, kW)
+    s = x.strides
+    win_shape = (batch, channels, H_out, W_out, kH, kW)
+    win_strides = (s[0], s[1], sH * s[2], sW * s[3], s[2], s[3])
+    x_win = xp.lib.stride_tricks.as_strided(x, shape=win_shape, strides=win_strides)
+
+    # Boolean mask where each window attains its maximum; ties split equally.
+    max_val = xp.max(x_win, axis=(4, 5), keepdims=True)
+    mask = (x_win == max_val).astype(g.dtype)
+    mask /= mask.sum(axis=(4, 5), keepdims=True)
+
+    # Weighted upstream gradient broadcast over kernel dims.
+    grad_win = g[:, :, :, :, xp.newaxis, xp.newaxis] * mask  # (B,C,H_out,W_out,kH,kW)
+
+    # Scatter-add: kH*kW vectorized writes, indexed by kernel offset.
+    grad_x = xp.zeros_like(x)
+    for kh in range(kH):
+        for kw in range(kW):
+            grad_x[:, :, kh : kh + H_out * sH : sH, kw : kw + W_out * sW : sW] += (
+                grad_win[:, :, :, :, kh, kw]
+            )
 
     if padding > 0:
-        grad_x = grad_x_padded[:, :, padding:-padding, padding:-padding]
-    else:
-        grad_x = grad_x_padded
+        grad_x = grad_x[:, :, padding:-padding, padding:-padding]
+    return grad_x
 
-    return grad_x if is_cpu else xp.asarray(grad_x)
 
 def _avg_pool2d_backward(g, x, kernel_size, stride=1, padding=0):
-    xp = get_xp(x)
-    is_cpu = (xp.__name__ == 'numpy')
-    g_np, x_np = as_numpy(g), as_numpy(x)
+    """Vectorized avg-pool backward via uniform scatter-add.
 
+    Each input element within a window receives g / (kH*kW).  Overlapping
+    windows accumulate via kH*kW vectorized additions — no Python loops over
+    batch, channel, or spatial dimensions.
+    """
+    xp = get_xp(x)
     if isinstance(kernel_size, int):
         kernel_size = (kernel_size, kernel_size)
     if isinstance(stride, int):
         stride = (stride, stride)
-
-    batch, channels, H, W = x_np.shape
     kH, kW = kernel_size
     sH, sW = stride
 
-    if padding > 0:
-        x_padded = np.pad(x_np, ((0, 0), (0, 0), (padding, padding), (padding, padding)))
-    else:
-        x_padded = x_np
-
-    H_padded, W_padded = x_padded.shape[2:]
+    batch, channels, H, W = x.shape
+    H_padded = H + 2 * padding
+    W_padded = W + 2 * padding
     H_out = (H_padded - kH) // sH + 1
     W_out = (W_padded - kW) // sW + 1
 
-    grad_x_padded = _avg_pool2d_backward_kernel(g_np, x_padded, kH, kW, sH, sW, H_out, W_out)
+    g_scaled = g / (kH * kW)  # uniform contribution per input element
+    grad_x = xp.zeros((batch, channels, H_padded, W_padded), dtype=g.dtype)
+    for kh in range(kH):
+        for kw in range(kW):
+            grad_x[:, :, kh : kh + H_out * sH : sH, kw : kw + W_out * sW : sW] += (
+                g_scaled
+            )
 
     if padding > 0:
-        grad_x = grad_x_padded[:, :, padding:-padding, padding:-padding]
-    else:
-        grad_x = grad_x_padded
+        grad_x = grad_x[:, :, padding:-padding, padding:-padding]
+    return grad_x
 
-    return grad_x if is_cpu else xp.asarray(grad_x)
 
 def _batch_norm_backward(g, x, weight, bias, mean, var, eps=1e-5):
     xp = get_xp(x)

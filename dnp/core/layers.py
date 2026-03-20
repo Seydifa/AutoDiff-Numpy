@@ -20,7 +20,7 @@ Organization:
 
 # Third-party libraries
 import numpy as np
-from .backend import get_xp, as_numpy
+from .backend import get_xp, as_numpy, get_dtype
 
 # Local imports: Core tensor and operations
 from .tensor import Tensor
@@ -75,7 +75,7 @@ class Module:
 
     def zero_grad(self):
         for p in self.parameters():
-            p.grad = np.zeros_like(p)
+            p.grad.fill(0.0)  # in-place; stays on the same device (CPU or GPU)
 
     def cpu(self):
         """Move all parameters in this module to the CPU."""
@@ -184,9 +184,9 @@ class Linear(Module):
 
     def forward(self, x: Tensor) -> Tensor:
         """Forward pass: (batch, in_features) -> (batch, out_features)."""
-        y = matmul(x, self.W)
+        y = x @ self.W
         if self.use_bias:
-            y = add(y, self.b)
+            y = y + self.b
         return y
 
 
@@ -232,7 +232,7 @@ class Conv2d(Module):
             self.b = None
 
     def forward(self, x: Tensor) -> Tensor:
-        """Forward pass using Numba-optimized kernel."""
+        """Forward pass using vectorized im2col + matmul kernel."""
         batch_size, in_channels, H, W = x.shape
         out_channels, _, kH, kW = self.W.shape
         stride_h, stride_w = self.stride
@@ -241,32 +241,30 @@ class Conv2d(Module):
         # Handle string padding modes
         if isinstance(pad, str):
             if pad.lower() == "same":
-                pad_h = (kH - 1) // 2
-                pad_w = (kW - 1) // 2
+                pad_h, pad_w = (kH - 1) // 2, (kW - 1) // 2
             elif pad.lower() == "valid":
-                pad_h, pad_w = 0, 0
+                pad_h = pad_w = 0
             else:
                 raise ValueError(f"Unknown padding mode: {pad}")
         else:
             pad_h = pad_w = pad
 
-        # Apply padding
+        # Apply padding — stays on the input device (CPU or GPU)
+        xp = get_xp(x.data)
         if pad_h > 0 or pad_w > 0:
-            x_padded = np.pad(
-                as_numpy(x.data if hasattr(x, 'data') else x),
+            x_padded = xp.pad(
+                x.data,
                 ((0, 0), (0, 0), (pad_h, pad_h), (pad_w, pad_w)),
-                mode="constant",
             )
         else:
-            x_padded = as_numpy(x.data if hasattr(x, 'data') else x)
+            x_padded = x.data
 
         # Compute output spatial dimensions
         H_out = (x_padded.shape[2] - kH) // stride_h + 1
         W_out = (x_padded.shape[3] - kW) // stride_w + 1
 
-        # Use Numba kernel for the forward pass
         y_data = _conv2d_forward_kernel(
-            x_padded, as_numpy(self.W.data), stride_h, stride_w, H_out, W_out
+            x_padded, self.W.data, stride_h, stride_w, H_out, W_out
         )
 
         # Wrap result in Tensor and add bias
@@ -274,7 +272,7 @@ class Conv2d(Module):
 
         if self.use_bias:
             bias_reshaped = self.b.reshape(1, out_channels, 1, 1)
-            y = add(y, bias_reshaped)
+            y = y + bias_reshaped
         return y
 
 
@@ -382,27 +380,29 @@ class BatchNorm1d(Module):
         self.weight = Tensor(np.ones(num_features), name="BN1d.weight")  # γ
         self.bias = Tensor(np.zeros(num_features), name="BN1d.bias")  # β
 
-        self.running_mean = np.zeros(num_features)
-        self.running_var = np.ones(num_features)
+        self.running_mean = np.zeros(num_features, dtype=get_dtype())
+        self.running_var = np.ones(num_features, dtype=get_dtype())
 
     def forward(self, x: Tensor) -> Tensor:
         """Forward pass using batch norm operation."""
+        xp = get_xp(x.data)
         if self.training:
-            mean = np.mean(as_numpy(x.data if hasattr(x, 'data') else x), axis=0)
-            var = np.var(as_numpy(x.data if hasattr(x, 'data') else x), axis=0)
-
+            mean = xp.mean(x.data, axis=0)
+            var = xp.var(x.data, axis=0)
+            # Running stats are always kept as plain numpy (not differentiable).
             self.running_mean = (
                 1 - self.momentum
-            ) * self.running_mean + self.momentum * mean
+            ) * self.running_mean + self.momentum * as_numpy(mean)
             self.running_var = (
                 1 - self.momentum
-            ) * self.running_var + self.momentum * var
+            ) * self.running_var + self.momentum * as_numpy(var)
         else:
-            mean = self.running_mean
-            var = self.running_var
+            mean = xp.asarray(self.running_mean)
+            var = xp.asarray(self.running_var)
 
-        # Use batch_norm operation with proper shape broadcasting
-        return batch_norm(x, self.weight, self.bias, mean, var, self.eps)
+        # Pass mean/var/eps as kwargs so they land in op_kwargs and are
+        # available to the VJP during the backward pass.
+        return batch_norm(x, self.weight, self.bias, mean=mean, var=var, eps=self.eps)
 
 
 class BatchNorm2d(Module):
@@ -418,46 +418,42 @@ class BatchNorm2d(Module):
         self.weight = Tensor(np.ones(num_features), name="BN2d.weight")  # γ
         self.bias = Tensor(np.zeros(num_features), name="BN2d.bias")  # β
 
-        self.running_mean = np.zeros(num_features)
-        self.running_var = np.ones(num_features)
+        self.running_mean = np.zeros(num_features, dtype=get_dtype())
+        self.running_var = np.ones(num_features, dtype=get_dtype())
 
     def forward(self, x: Tensor) -> Tensor:
         """Forward pass using batch norm operation."""
-        x_np = as_numpy(x.data if hasattr(x, 'data') else x)
+        xp = get_xp(x.data)
         if self.training:
-            mean = np.mean(x_np, axis=(0, 2, 3))
-            var = np.var(x_np, axis=(0, 2, 3))
-
+            mean = xp.mean(x.data, axis=(0, 2, 3))
+            var = xp.var(x.data, axis=(0, 2, 3))
             self.running_mean = (
                 1 - self.momentum
-            ) * self.running_mean + self.momentum * mean
+            ) * self.running_mean + self.momentum * as_numpy(mean)
             self.running_var = (
                 1 - self.momentum
-            ) * self.running_var + self.momentum * var
+            ) * self.running_var + self.momentum * as_numpy(var)
         else:
-            mean = self.running_mean
-            var = self.running_var
+            mean = xp.asarray(self.running_mean)
+            var = xp.asarray(self.running_var)
 
         # Reshape for broadcasting: (C,) -> (1, C, 1, 1)
         shape_for_norm = (1, self.num_features, 1, 1)
-        mean_reshaped = mean.reshape(shape_for_norm)
-        var_reshaped = var.reshape(shape_for_norm)
-        weight_reshaped = np.asarray(self.weight).reshape(shape_for_norm)
-        bias_reshaped = as_numpy(self.bias.data).reshape(shape_for_norm)
+        mean_r = mean.reshape(shape_for_norm)
+        var_r = var.reshape(shape_for_norm)
 
-        # Use batch_norm operation
-        return batch_norm(
-            x,
-            Tensor(weight_reshaped),
-            Tensor(bias_reshaped),
-            mean_reshaped,
-            var_reshaped,
-            self.eps,
-        )
+        # ops.reshape keeps weight and bias connected to the graph so their
+        # gradients are properly accumulated during backward.
+        weight_r = ops.reshape(self.weight, newshape=shape_for_norm)
+        bias_r = ops.reshape(self.bias, newshape=shape_for_norm)
+
+        # Pass mean/var/eps as kwargs so they're stored in op_kwargs for VJP.
+        return batch_norm(x, weight_r, bias_r, mean=mean_r, var=var_r, eps=self.eps)
 
 
 class LayerNorm(Module):
     """Layer normalization."""
+
     def __init__(self, ndim, bias=True, eps=1e-5):
         super().__init__()
         self.eps = eps
@@ -467,31 +463,31 @@ class LayerNorm(Module):
             self.beta = Tensor(np.zeros(ndim), name="LN_beta")
 
     def forward(self, x: Tensor) -> Tensor:
-        # Calculate mean along last axis
         mean = ops.mean(x, axis=-1, keepdims=True)
-        diff = ops.subtract(x, mean)
-        sq_diff = ops.square(diff)
-        var = ops.mean(sq_diff, axis=-1, keepdims=True)
-        # Wrapping eps in a Tensor to prevent backwards arguments matching issue
-        eps_t = Tensor(np.array([self.eps], dtype=np.float32))
-        std = ops.sqrt(ops.add(var, eps_t))
-        x_norm = ops.divide(diff, std)
-        out = ops.multiply(x_norm, self.gamma)
+        diff = x - mean
+        # ops.square (not diff**2) — the scalar exponent 2 is not a Tensor and
+        # therefore not stored as a parent, which breaks the np.power VJP.
+        var = ops.mean(ops.square(diff), axis=-1, keepdims=True)
+        eps_t = Tensor(np.array([self.eps]))  # float64 — matches default tensor dtype
+        std = ops.sqrt(var + eps_t)
+        x_norm = diff / std
+        out = x_norm * self.gamma
         if self.use_bias:
-            out = ops.add(out, self.beta)
+            out = out + self.beta
         return out
 
 
 class Embedding(Module):
     """Embedding layer constructed with one-hot encoding for autograd compatibility."""
+
     def __init__(self, num_embeddings, embedding_dim, name="Embedding"):
         super().__init__()
         self.lin = Linear(num_embeddings, embedding_dim, bias=False, name=name)
         self.num_embeddings = num_embeddings
-        
+
     def forward(self, x_idx):
-        x_idx_np = (x_idx.data if hasattr(x_idx, 'data') else x_idx) if hasattr(x_idx, 'data') else x_idx
-        one_hot = np.eye(self.num_embeddings)[x_idx_np]
+        x_np = as_numpy(x_idx.data if isinstance(x_idx, Tensor) else x_idx).astype(int)
+        one_hot = np.eye(self.num_embeddings)[x_np]
         return self.lin(Tensor(one_hot))
 
 
@@ -538,28 +534,20 @@ class ScaledDotProductAttention(Module):
         Returns:
             output: (..., seq_len_q, d_v)
         """
-        # Compute attention scores by transposing last 2 dims of key
-        # Use ops.transpose to preserve the computational graph
-        ndim = len((key.data if hasattr(key, 'data') else key).shape)
+        # Transpose last two dims of key — stays in the graph via ops.transpose.
+        ndim = key.data.ndim
         axes = list(range(ndim))
         axes[-1], axes[-2] = axes[-2], axes[-1]
-        key_transposed = ops.transpose(key, axes=tuple(axes))
-        
-        scores = matmul(query, key_transposed)
-        
-        scale_t = Tensor(np.array([self.scale], dtype=np.float32))
-        scores = ops.multiply(scores, scale_t)
+        key_T = ops.transpose(key, axes=tuple(axes))
+
+        scores = query @ key_T
+        scores = scores * Tensor(np.array([self.scale]))  # float64 scalar
 
         if mask is not None:
-            # Mask must also be a Tensor
-            scores = ops.add(scores, mask)
+            scores = scores + mask
 
-        # Apply softmax
         attn_weights = softmax(scores)
-
-        # Apply attention to values
-        output = matmul(attn_weights, value)
-        return output
+        return attn_weights @ value
 
 
 class MultiHeadAttention(Module):
@@ -586,8 +574,7 @@ class MultiHeadAttention(Module):
         Returns:
             output: (batch, seq_len, d_model)
         """
-        batch_size = (query.data if hasattr(query, 'data') else query).shape[0]
-        seq_len = (query.data if hasattr(query, 'data') else query).shape[1]
+        batch_size, seq_len = query.shape[:2]
 
         # Linear projections
         q = self.W_q(query)  # (batch, seq_len, d_model)
@@ -611,7 +598,9 @@ class MultiHeadAttention(Module):
         attn_output = ops.transpose(attn_output, axes=(0, 2, 1, 3))
 
         # Reshape: (batch, seq_len, num_heads, d_k) -> (batch, seq_len, d_model)
-        attn_output = ops.reshape(attn_output, newshape=(batch_size, seq_len, self.d_model))
+        attn_output = ops.reshape(
+            attn_output, newshape=(batch_size, seq_len, self.d_model)
+        )
 
         # Final linear projection
         output = self.W_o(attn_output)
@@ -639,30 +628,36 @@ class SelfAttention(Module):
 # LOSS FUNCTIONS
 # ============================================================================
 
+
 class CrossEntropyLoss(Module):
     """Cross-entropy loss for multi-class classification."""
+
     def forward(self, logits: Tensor, targets) -> Tensor:
-        shape = (logits.data if hasattr(logits, 'data') else logits).shape
+        shape = logits.shape
         if len(shape) > 2:
             B, T, V = shape[0], shape[1], shape[2]
             logits_flat = ops.reshape(logits, newshape=(B * T, V))
         else:
             V = shape[1]
             logits_flat = logits
-            
-        targets_flat = (targets.data if hasattr(targets, 'data') else targets).flatten()
-            
+
+        targets_np = (
+            as_numpy(targets.data if isinstance(targets, Tensor) else targets)
+            .flatten()
+            .astype(int)
+        )
+
         probs = ops.softmax(logits_flat)
-        eps_tensor = Tensor(np.array([1e-8], dtype=np.float32))
-        log_probs = ops.log(ops.add(probs, eps_tensor))
-        
-        one_hot = np.eye(V, dtype=np.float32)[targets_flat]
+        eps_tensor = Tensor(np.array([1e-8]))  # float64
+        log_probs = ops.log(probs + eps_tensor)
+
+        one_hot = np.eye(V)[targets_np]  # float64
         t_one_hot = Tensor(one_hot)
-        
-        selected = ops.multiply(log_probs, t_one_hot)
+
+        selected = log_probs * t_one_hot
         summed = ops.sum(selected, axis=-1)
-        loss = ops.negative(ops.mean(summed))
-        return loss
+        return -ops.mean(summed)
+
 
 # ============================================================================
 # UTILITY LAYERS
@@ -678,7 +673,7 @@ class Flatten(Module):
         self.end_dim = end_dim
 
     def forward(self, x: Tensor) -> Tensor:
-        shape = as_numpy(x.data if hasattr(x, 'data') else x).shape
+        shape = x.shape  # Tensor.shape is already a tuple
         ndim = len(shape)
         start = self.start_dim % ndim
         end = self.end_dim % ndim
@@ -688,16 +683,9 @@ class Flatten(Module):
                 f"Invalid range [{start}, {end}] for flattening tensor of ndim {ndim}."
             )
 
-        new_shape = (
-            shape[:start] + (-1,) + shape[end + 1 :]
-        )  # -1 replaces flattened dims
-
-        return Tensor(
-            as_numpy(x.data if hasattr(x, 'data') else x).reshape(new_shape),
-            parents=[x],
-            op_func=lambda: None,
-            name="Flatten",
-        )
+        new_shape = shape[:start] + (-1,) + shape[end + 1 :]
+        # ops.reshape registers the node in VJP_RULES, so gradients flow properly.
+        return ops.reshape(x, newshape=new_shape)
 
 
 # ============================================================================

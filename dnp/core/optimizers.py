@@ -16,8 +16,8 @@ This module provides a family of optimizers for gradient-based learning:
 # Standard library
 from typing import List, Dict, Any
 
-# Third-party libraries
-import numpy as np
+# Local imports
+from .backend import get_xp
 
 
 class Optimizer:
@@ -240,12 +240,13 @@ class Adam(Optimizer):
 
         # Initialize first and second moment estimates for each parameter
         # We use the Python object ID as the dictionary key to uniquely
-        # identify each parameter tensor
-        self.m: Dict[int, np.ndarray] = {
-            id(p): np.zeros_like(p) for p in self.parameters
+        # identify each parameter tensor.
+        # State is allocated on the same device as the parameter.
+        self.m: Dict[int, Any] = {
+            id(p): get_xp(p.data).zeros_like(p.data) for p in self.parameters
         }
-        self.v: Dict[int, np.ndarray] = {
-            id(p): np.zeros_like(p) for p in self.parameters
+        self.v: Dict[int, Any] = {
+            id(p): get_xp(p.data).zeros_like(p.data) for p in self.parameters
         }
 
     def step(self) -> None:
@@ -289,7 +290,8 @@ class Adam(Optimizer):
             # The denominator sqrt(v_hat) + epsilon provides adaptive per-parameter
             # learning rates, reducing the effective learning rate for parameters
             # with large gradient variance and increasing it for those with small variance
-            p[...] = p - self.lr * m_hat / (np.sqrt(v_hat) + self.epsilon)
+            xp = get_xp(v_hat)
+            p[...] = p - self.lr * m_hat / (xp.sqrt(v_hat) + self.epsilon)
 
 
 class Momentum(Optimizer):
@@ -362,8 +364,8 @@ class Momentum(Optimizer):
         self.momentum = momentum
         self.dampening = dampening
         self.nesterov = nesterov
-        self.velocity: Dict[int, np.ndarray] = {
-            id(p): np.zeros_like(p) for p in self.parameters
+        self.velocity: Dict[int, Any] = {
+            id(p): get_xp(p.data).zeros_like(p.data) for p in self.parameters
         }
 
     def step(self) -> None:
@@ -467,12 +469,12 @@ class RMSprop(Optimizer):
         self.epsilon = epsilon
         self.centered = centered
 
-        self.sq_avg: Dict[int, np.ndarray] = {
-            id(p): np.zeros_like(p) for p in self.parameters
+        self.sq_avg: Dict[int, Any] = {
+            id(p): get_xp(p.data).zeros_like(p.data) for p in self.parameters
         }
         if centered:
-            self.buffer: Dict[int, np.ndarray] = {
-                id(p): np.zeros_like(p) for p in self.parameters
+            self.buffer: Dict[int, Any] = {
+                id(p): get_xp(p.data).zeros_like(p.data) for p in self.parameters
             }
 
     def step(self) -> None:
@@ -504,7 +506,8 @@ class RMSprop(Optimizer):
                 denominator = self.sq_avg[pid] + self.epsilon
 
             # Update parameter: p = p - lr * grad / sqrt(denominator)
-            p[...] = p - self.lr * grad / np.sqrt(denominator)
+            xp = get_xp(denominator)
+            p[...] = p - self.lr * grad / xp.sqrt(denominator)
 
 
 class Adagrad(Optimizer):
@@ -571,8 +574,8 @@ class Adagrad(Optimizer):
         """Initialize the Adagrad optimizer."""
         super().__init__(parameters, lr)
         self.epsilon = epsilon
-        self.sq_sum: Dict[int, np.ndarray] = {
-            id(p): np.zeros_like(p) for p in self.parameters
+        self.sq_sum: Dict[int, Any] = {
+            id(p): get_xp(p.data).zeros_like(p.data) for p in self.parameters
         }
 
     def step(self) -> None:
@@ -593,7 +596,8 @@ class Adagrad(Optimizer):
             self.sq_sum[pid] = self.sq_sum[pid] + grad**2
 
             # Update parameter: p = p - lr * grad / sqrt(G + epsilon)
-            p[...] = p - self.lr * grad / (np.sqrt(self.sq_sum[pid]) + self.epsilon)
+            xp = get_xp(self.sq_sum[pid])
+            p[...] = p - self.lr * grad / (xp.sqrt(self.sq_sum[pid]) + self.epsilon)
 
 
 class AdamW(Optimizer):
@@ -686,11 +690,11 @@ class AdamW(Optimizer):
         self.weight_decay = weight_decay
         self.t = 0
 
-        self.m: Dict[int, np.ndarray] = {
-            id(p): np.zeros_like(p) for p in self.parameters
+        self.m: Dict[int, Any] = {
+            id(p): get_xp(p.data).zeros_like(p.data) for p in self.parameters
         }
-        self.v: Dict[int, np.ndarray] = {
-            id(p): np.zeros_like(p) for p in self.parameters
+        self.v: Dict[int, Any] = {
+            id(p): get_xp(p.data).zeros_like(p.data) for p in self.parameters
         }
 
     def step(self) -> None:
@@ -722,6 +726,7 @@ class AdamW(Optimizer):
             # AdamW update: adaptive step + decoupled weight decay
             # The key difference from Adam: weight decay is applied directly,
             # not scaled by the adaptive learning rate
-            adaptive_update = self.lr * m_hat / (np.sqrt(v_hat) + self.epsilon)
-            weight_decay_update = self.weight_decay * self.lr * np.asarray(p)
-            p[...] = np.asarray(p) - adaptive_update - weight_decay_update
+            xp = get_xp(v_hat)
+            adaptive_update = self.lr * m_hat / (xp.sqrt(v_hat) + self.epsilon)
+            weight_decay_update = self.weight_decay * self.lr * p.data
+            p[...] = p.data - adaptive_update - weight_decay_update

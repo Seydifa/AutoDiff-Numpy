@@ -1,6 +1,9 @@
 # Local imports: Core modules
 from . import ops, core
 
+# Dtype control — primary public API
+from .core.backend import set_dtype, get_dtype
+
 # Local imports: Layer classes available at top level
 from .layers import (
     Module,
@@ -36,6 +39,9 @@ from .core.optimizers import (
 __all__ = [
     "ops",
     "core",
+    # Dtype control
+    "set_dtype",
+    "get_dtype",
     # Base classes
     "Module",
     "Sequential",
