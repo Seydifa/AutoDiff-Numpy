@@ -23,6 +23,7 @@ from .layers import (
     BatchNorm1d,
     BatchNorm2d,
     Dropout,
+    Embedding,
     ScaledDotProductAttention,
     MultiHeadAttention,
     SelfAttention,
@@ -91,6 +92,8 @@ __all__ = [
     "BatchNorm2d",
     # Regularization layers
     "Dropout",
+    # Embedding layers
+    "Embedding",
     # Attention layers
     "ScaledDotProductAttention",
     "MultiHeadAttention",

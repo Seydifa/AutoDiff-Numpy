@@ -49,6 +49,7 @@ from dnp.core.ops import (
     swish,
     gelu,
     softmax,
+    gather,
 )
 
 __all__ = [
@@ -98,4 +99,5 @@ __all__ = [
     "swish",
     "gelu",
     "softmax",
+    "gather",
 ]

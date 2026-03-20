@@ -188,6 +188,69 @@ class _DropoutOps(Ops):
 
 
 # ---------------------------------------------------------------------------
+# Gather Op — W[indices], differentiable w.r.t. W via scatter-add
+# ---------------------------------------------------------------------------
+
+
+def _gather_forward(W, indices):
+    """Forward function for the gather op: ``output = W[indices]``."""
+    return W[indices]
+
+
+class _GatherOps(Ops):
+    """Gather op — ``output = W[indices]``.
+
+    Only *W* is differentiable; *indices* are integer arrays and carry no
+    gradient.  The VJP is a scatter-add::
+
+        dW[indices] += upstream_grad
+
+    ``vpj()`` is overridden here so the backward is fully self-contained
+    without needing a separate entry in the global ``VJP_RULES`` dict.
+    This also means any ``Ops`` subclass can define its own backward by
+    simply overriding ``vpj()``.
+    """
+
+    def _raw_call(self, *args, **kwargs):
+        from .tensor import Tensor
+        from .backend import get_xp, as_numpy
+
+        W = args[0]
+        # indices may be a raw int array OR a Tensor (graph_fn converts numpy
+        # arrays to Tensor automatically; we unwrap it back to plain ints).
+        raw_idx = args[1] if len(args) > 1 else kwargs.get("indices")
+        if isinstance(raw_idx, Tensor):
+            indices = as_numpy(raw_idx.data).astype(int)
+        else:
+            indices = np.asarray(raw_idx, dtype=int)
+
+        W_data = W.data if isinstance(W, Tensor) else W
+        out_data = W_data[indices]
+
+        parents = [W] if isinstance(W, Tensor) else []
+        if not parents:
+            return out_data
+
+        return Tensor(
+            out_data,
+            parents=parents,
+            op_func=self,  # backward dispatches via self.vpj()
+            op_kwargs={"indices": indices},
+            name=self.name,
+        )
+
+    def vpj(self, grad, W, **op_kwargs):
+        """Scatter-add VJP: dW[indices] += grad."""
+        from .backend import get_xp
+
+        indices = op_kwargs["indices"]
+        xp = get_xp(W)
+        dW = xp.zeros_like(W)
+        xp.add.at(dW, indices, grad)
+        return (dW,)
+
+
+# ---------------------------------------------------------------------------
 # Binary operations
 # ---------------------------------------------------------------------------
 add = Ops(np.add, name="add")
@@ -265,6 +328,9 @@ dropout = _DropoutOps(dropout, name="dropout")
 
 # Normalization operations
 batch_norm = Ops(batch_norm, name="batch_norm")
+
+# Embedding gather — differentiable index lookup (scatter-add VJP)
+gather = _GatherOps(_gather_forward, name="gather")
 
 
 # ---------------------------------------------------------------------------

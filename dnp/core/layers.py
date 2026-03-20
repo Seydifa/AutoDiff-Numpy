@@ -37,6 +37,7 @@ from .ops import (
     avg_pool2d,
     dropout,
     batch_norm,
+    gather,
 )
 
 # ============================================================================
@@ -596,56 +597,31 @@ class LayerNorm(Module):
 class Embedding(Module):
     """Embedding lookup layer with efficient direct-index slicing.
 
-    v3: Replaced the O(vocab_size) one-hot matrix-multiply with a direct
-    index slice ``W[indices]``, reducing memory from O(seq_len * vocab_size)
-    to O(seq_len * embed_dim).  The custom ``_gather`` op wires a
-    scatter-add VJP so gradients flow back to the embedding weight matrix.
+    Uses ``ops.gather`` — a dedicated ``_GatherOps`` instance whose ``vpj()``
+    implements the scatter-add backward.  The weight matrix is registered via
+    ``add_weight()`` so it participates in ``parameters()``, ``zero_grad()``,
+    and ``named_parameters()`` like every other trainable weight.
     """
 
     def __init__(
         self, num_embeddings: int, embedding_dim: int, name: str = "Embedding"
     ):
         super().__init__()
-        std = np.sqrt(1.0 / num_embeddings)
-        self.W = Tensor(
-            np.random.randn(num_embeddings, embedding_dim) * std,
-            name=f"{name}_weight",
-        )
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
+        # Use add_weight so the embedding matrix is a first-class Module weight.
+        self.W = self.add_weight(
+            "W",
+            shape=(num_embeddings, embedding_dim),
+            # Scale initialisation: std = 1 / sqrt(num_embeddings)
+            initializer=lambda shape: np.random.randn(*shape) * np.sqrt(1.0 / shape[0]),
+        )
 
     def forward(self, x_idx):
         """x_idx : integer array / Tensor of shape (seq_len,) or (batch, seq_len)."""
         x_np = as_numpy(x_idx.data if isinstance(x_idx, Tensor) else x_idx).astype(int)
-        # Direct slice — O(seq_len * embed_dim) instead of O(seq_len * vocab_size)
-        out_data = self.W.data[x_np]  # shape: (*x_idx.shape, embed_dim)
-        out = Tensor(
-            out_data,
-            parents=[self.W],
-            op_func=_embedding_gather,
-            op_kwargs={"indices": x_np},
-            name="Embedding_out",
-        )
-        return out
-
-
-def _embedding_gather(W, indices):
-    """Forward: W[indices]  (stored as op_func key in VJP_RULES)."""
-    return W[indices]
-
-
-def _vjp_embedding_gather(g, W, indices):
-    """Scatter-add: dW[i] += sum of upstream grads that selected row i."""
-    xp = get_xp(g)
-    dW = xp.zeros_like(W)
-    xp.add.at(dW, indices, g)
-    return (dW,)
-
-
-# Register VJP for the embedding gather op.
-from .vjp_rules import VJP_RULES  # noqa: E402  (local import avoids circularity)
-
-VJP_RULES[_embedding_gather] = _vjp_embedding_gather
+        # ops.gather: O(seq_len × embed_dim) — no one-hot matrix, no full matmul.
+        return gather(self.W, x_np)
 
 
 # ============================================================================
