@@ -74,10 +74,20 @@ class Ops:
 
         out_data = self.func(*args_data, **kwargs_data)
 
-        parents = [a for a in args if isinstance(a, Tensor)]
+        # Collect Tensor parents (positional only; kwargs Tensors are rare and
+        # handled separately via op_kwargs).
+        parent_indices = [i for i, a in enumerate(args) if isinstance(a, Tensor)]
+        parents = [args[i] for i in parent_indices]
         parents.extend([v for v in kwargs.values() if isinstance(v, Tensor)])
 
         op_kwargs = {k: v for k, v in kwargs.items() if not isinstance(v, Tensor)}
+
+        # When there are non-Tensor positional args mixed with Tensor args (e.g.
+        # subtract(1.0, tensor)), the backward pass needs the full args list to
+        # call the VJP rule correctly and to map gradients to the right parents.
+        if len(parent_indices) < len(args):
+            op_kwargs["_vjp_args"] = args_data
+            op_kwargs["_vjp_parent_indices"] = parent_indices
 
         if not parents:
             return out_data

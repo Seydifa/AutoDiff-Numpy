@@ -27,6 +27,10 @@ from .layers import (
     MultiHeadAttention,
     SelfAttention,
     Flatten,
+    CrossEntropyLoss,
+    MSELoss,
+    BCELoss,
+    BCEWithLogitsLoss,
 )
 
 # Local imports: Optimizer classes available at top level
@@ -93,6 +97,11 @@ __all__ = [
     "SelfAttention",
     # Utility layers
     "Flatten",
+    # Loss functions
+    "CrossEntropyLoss",
+    "MSELoss",
+    "BCELoss",
+    "BCEWithLogitsLoss",
     # Optimization algorithms
     "Optimizer",
     "SGD",

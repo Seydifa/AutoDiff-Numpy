@@ -21,6 +21,9 @@ from dnp.core.layers import (
     SelfAttention,
     Flatten,
     CrossEntropyLoss,
+    MSELoss,
+    BCELoss,
+    BCEWithLogitsLoss,
 )
 
 __all__ = [
@@ -49,6 +52,9 @@ __all__ = [
     "Dropout",
     # Loss layers
     "CrossEntropyLoss",
+    "MSELoss",
+    "BCELoss",
+    "BCEWithLogitsLoss",
     # Attention layers
     "ScaledDotProductAttention",
     "MultiHeadAttention",

@@ -173,11 +173,41 @@ class Tensor:
         for node in topo:
             if node.op_func not in VJP_RULES or not node.parents:
                 continue
-            args_data = [p.data if isinstance(p, Tensor) else p for p in node.parents]
-            gradients = VJP_RULES[node.op_func](node.grad, *args_data, **node.op_kwargs)
-            for parent, g in zip(node.parents, gradients):
-                if isinstance(parent, Tensor):
-                    parent.grad += g
+
+            if "_vjp_args" in node.op_kwargs:
+                # Mixed scalar + Tensor positional args: use stored full arg list
+                # so the VJP lambda receives the correct signature.
+                # Wrap plain Python scalars as 0-d numpy arrays so VJP lambdas
+                # that call `.shape` on all args (e.g. unbroadcast) don't fail.
+                import numpy as _np_bwd
+
+                vjp_args = [
+                    _np_bwd.asarray(a) if isinstance(a, (int, float)) else a
+                    for a in node.op_kwargs["_vjp_args"]
+                ]
+                parent_indices = node.op_kwargs["_vjp_parent_indices"]
+                other_kwargs = {
+                    k: v
+                    for k, v in node.op_kwargs.items()
+                    if k not in ("_vjp_args", "_vjp_parent_indices")
+                }
+                all_grads = VJP_RULES[node.op_func](
+                    node.grad, *vjp_args, **other_kwargs
+                )
+                # Only assign gradients for the Tensor parents (by original index)
+                for parent, orig_idx in zip(node.parents, parent_indices):
+                    if isinstance(parent, Tensor):
+                        parent.grad += all_grads[orig_idx]
+            else:
+                args_data = [
+                    p.data if isinstance(p, Tensor) else p for p in node.parents
+                ]
+                gradients = VJP_RULES[node.op_func](
+                    node.grad, *args_data, **node.op_kwargs
+                )
+                for parent, g in zip(node.parents, gradients):
+                    if isinstance(parent, Tensor):
+                        parent.grad += g
 
     def __repr__(self):
         return f"Tensor({repr(self.data)}, name='{self.name}', device='{self.device}')"

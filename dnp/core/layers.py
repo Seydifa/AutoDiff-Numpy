@@ -823,6 +823,115 @@ class CrossEntropyLoss(Module):
 # ============================================================================
 
 
+class MSELoss(Module):
+    """Mean Squared Error loss.
+
+    .. math::
+        \\mathcal{L} = \\frac{1}{N} \\sum_i (y_{\\text{pred},i} - y_{\\text{true},i})^2
+
+    Parameters
+    ----------
+    reduction : ``"mean"`` | ``"sum"`` | ``"none"``
+        Specifies the reduction to apply over the batch dimension.
+    """
+
+    def __init__(self, reduction: str = "mean"):
+        super().__init__()
+        if reduction not in ("mean", "sum", "none"):
+            raise ValueError(
+                f"reduction must be 'mean', 'sum', or 'none', got '{reduction}'"
+            )
+        self.reduction = reduction
+
+    def forward(self, y_pred: Tensor, y_true: Tensor) -> Tensor:
+        diff = y_pred - y_true
+        sq = ops.square(diff)
+        if self.reduction == "mean":
+            return ops.mean(sq)
+        if self.reduction == "sum":
+            return ops.sum(sq)
+        return sq  # 'none'
+
+
+class BCELoss(Module):
+    """Binary Cross-Entropy loss (expects probabilities, not logits).
+
+    .. math::
+        \\mathcal{L} = -\\frac{1}{N}\\sum_i \\bigl[
+            y_i \\log(\\hat{y}_i + \\epsilon)
+            + (1 - y_i) \\log(1 - \\hat{y}_i + \\epsilon)
+        \\bigr]
+
+    Parameters
+    ----------
+    reduction : ``"mean"`` | ``"sum"`` | ``"none"``
+    """
+
+    def __init__(self, reduction: str = "mean"):
+        super().__init__()
+        if reduction not in ("mean", "sum", "none"):
+            raise ValueError(
+                f"reduction must be 'mean', 'sum', or 'none', got '{reduction}'"
+            )
+        self.reduction = reduction
+
+    def forward(self, y_pred: Tensor, y_true: Tensor) -> Tensor:
+        # Clamp via log — add small epsilon to avoid log(0)
+        eps = 1e-8
+        pos = y_true * ops.log(y_pred + eps)
+        neg = (1.0 - y_true) * ops.log(1.0 - y_pred + eps)
+        loss = -(pos + neg)
+        if self.reduction == "mean":
+            return ops.mean(loss)
+        if self.reduction == "sum":
+            return ops.sum(loss)
+        return loss  # 'none'
+
+
+class BCEWithLogitsLoss(Module):
+    """Binary Cross-Entropy with logits (numerically stable sigmoid + BCE).
+
+    Applies :math:`\\sigma(x)` internally, so pass raw logits — do **not**
+    apply sigmoid beforehand.
+
+    .. math::
+        \\mathcal{L} = -\\frac{1}{N}\\sum_i \\bigl[
+            y_i \\log(\\sigma(x_i))
+            + (1-y_i) \\log(1-\\sigma(x_i))
+        \\bigr]
+
+    which simplifies to:
+
+    .. math::
+        \\mathcal{L} = \\frac{1}{N}\\sum_i \\bigl[
+            \\max(x_i, 0) - x_i y_i + \\log(1 + e^{-|x_i|})
+        \\bigr]
+
+    Parameters
+    ----------
+    reduction : ``"mean"`` | ``"sum"`` | ``"none"``
+    """
+
+    def __init__(self, reduction: str = "mean"):
+        super().__init__()
+        if reduction not in ("mean", "sum", "none"):
+            raise ValueError(
+                f"reduction must be 'mean', 'sum', or 'none', got '{reduction}'"
+            )
+        self.reduction = reduction
+
+    def forward(self, logits: Tensor, y_true: Tensor) -> Tensor:
+        # Numerically stable: max(x,0) - x*y + log(1 + exp(-|x|))
+        relu_x = ops.relu(logits)
+        abs_x = ops.absolute(logits)
+        loss = relu_x - logits * y_true + ops.log1p(ops.exp(-abs_x))
+        if self.reduction == "mean":
+            return ops.mean(loss)
+        if self.reduction == "sum":
+            return ops.sum(loss)
+        return loss  # 'none'
+
+
 class Flatten(Module):
     """Flattens a tensor along specified dimensions."""
 
@@ -879,6 +988,9 @@ __all__ = [
     "MultiHeadAttention",
     "SelfAttention",
     "CrossEntropyLoss",
+    "MSELoss",
+    "BCELoss",
+    "BCEWithLogitsLoss",
     # Utility layers
     "Flatten",
 ]
