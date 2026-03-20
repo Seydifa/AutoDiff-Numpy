@@ -171,30 +171,35 @@ class Tensor:
         # --- Step 3: Propagate in topological order ---
         # Each node is visited exactly once, with its fully-accumulated gradient.
         for node in topo:
-            if node.op_func not in VJP_RULES or not node.parents:
+            op = node.op_func
+            # Route through Ops.vpj() when the op is an Ops instance (all ops
+            # built via the Ops class store `self` as op_func so vpj() is the
+            # single authoritative VJP dispatch point).  Fall back to the
+            # VJP_RULES dict for raw-function ops registered directly (e.g.
+            # custom _embedding_gather ops in layers.py).
+            has_vjp = hasattr(op, "vpj") or op in VJP_RULES
+            if not has_vjp or not node.parents:
                 continue
 
             if "_vjp_args" in node.op_kwargs:
-                # Mixed scalar + Tensor positional args: use stored full arg list
-                # so the VJP lambda receives the correct signature.
-                # Wrap plain Python scalars as 0-d numpy arrays so VJP lambdas
-                # that call `.shape` on all args (e.g. unbroadcast) don't fail.
-                import numpy as _np_bwd
-
-                vjp_args = [
-                    _np_bwd.asarray(a) if isinstance(a, (int, float)) else a
-                    for a in node.op_kwargs["_vjp_args"]
-                ]
+                # Mixed scalar + Tensor positional args — vpj() handles the
+                # full arg list reconstruction internally (see Ops.vpj).
                 parent_indices = node.op_kwargs["_vjp_parent_indices"]
-                other_kwargs = {
-                    k: v
-                    for k, v in node.op_kwargs.items()
-                    if k not in ("_vjp_args", "_vjp_parent_indices")
-                }
-                all_grads = VJP_RULES[node.op_func](
-                    node.grad, *vjp_args, **other_kwargs
-                )
-                # Only assign gradients for the Tensor parents (by original index)
+                if hasattr(op, "vpj"):
+                    all_grads = op.vpj(node.grad, **node.op_kwargs)
+                else:
+                    import numpy as _np_bwd
+
+                    vjp_args = [
+                        _np_bwd.asarray(a) if isinstance(a, (int, float)) else a
+                        for a in node.op_kwargs["_vjp_args"]
+                    ]
+                    other_kwargs = {
+                        k: v
+                        for k, v in node.op_kwargs.items()
+                        if k not in ("_vjp_args", "_vjp_parent_indices")
+                    }
+                    all_grads = VJP_RULES[op](node.grad, *vjp_args, **other_kwargs)
                 for parent, orig_idx in zip(node.parents, parent_indices):
                     if isinstance(parent, Tensor):
                         parent.grad += all_grads[orig_idx]
@@ -202,9 +207,10 @@ class Tensor:
                 args_data = [
                     p.data if isinstance(p, Tensor) else p for p in node.parents
                 ]
-                gradients = VJP_RULES[node.op_func](
-                    node.grad, *args_data, **node.op_kwargs
-                )
+                if hasattr(op, "vpj"):
+                    gradients = op.vpj(node.grad, *args_data, **node.op_kwargs)
+                else:
+                    gradients = VJP_RULES[op](node.grad, *args_data, **node.op_kwargs)
                 for parent, g in zip(node.parents, gradients):
                     if isinstance(parent, Tensor):
                         parent.grad += g

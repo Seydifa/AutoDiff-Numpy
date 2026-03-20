@@ -95,23 +95,46 @@ class Ops:
         return Tensor(
             out_data,
             parents=parents,
-            op_func=self.func,
+            op_func=self,  # store the Ops instance — backward dispatches via self.vpj()
             op_kwargs=op_kwargs,
             name=self.name,
         )
 
-    def vpj(self, *args, **kwargs):
-        """Look up and call the VJP rule for this op.
+    def vpj(self, grad, *args, **op_kwargs):
+        """Compute and return the VJP tuple for this op.
 
-        Signature mirrors VJP_RULES: ``vpj(grad, *inputs, **op_kwargs)``.
-        This is provided for backward compatibility and introspection.
+        This is the authoritative VJP dispatch point for every ``Ops``
+        instance.  ``Tensor.backward()`` calls ``op.vpj(...)`` directly
+        so the rule lookup always goes through here — never bypassing the
+        ``Ops`` object by hitting ``VJP_RULES`` directly.
+
+        Handles the ``_vjp_args`` / ``_vjp_parent_indices`` keys that
+        ``_raw_call`` inserts when positional args are a mix of scalars
+        and Tensors (e.g. ``1.0 - tensor``).
         """
-        from .vjp_rules import VJP_RULES
+        import numpy as _np
+
+        if "_vjp_args" in op_kwargs:
+            # Reconstruct the full positional arg list; wrap plain scalars as
+            # 0-d arrays so VJP lambdas that call `.shape` on all args work.
+            full_args = [
+                _np.asarray(a) if isinstance(a, (int, float)) else a
+                for a in op_kwargs["_vjp_args"]
+            ]
+            clean_kwargs = {
+                k: v
+                for k, v in op_kwargs.items()
+                if k not in ("_vjp_args", "_vjp_parent_indices")
+            }
+            rule = VJP_RULES.get(self.func)
+            if rule is None:
+                raise KeyError(f"No VJP rule found for '{self.name}'")
+            return rule(grad, *full_args, **clean_kwargs)
 
         rule = VJP_RULES.get(self.func)
         if rule is None:
             raise KeyError(f"No VJP rule found for '{self.name}'")
-        return rule(*args, **kwargs)
+        return rule(grad, *args, **op_kwargs)
 
     def __call__(self, *args, **kwargs):
         return self._graph_call(*args, **kwargs)
