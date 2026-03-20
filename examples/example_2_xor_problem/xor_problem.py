@@ -3,17 +3,13 @@ Example 2: Learning the XOR Problem with Neural Networks
 ===========================================================
 
 This example demonstrates learning a non-linear decision boundary.
-The XOR problem is a classic example that cannot be solved by a linear model,
-requiring at least one hidden layer with non-linear activations.
+It showcases the v3 features:
 
-The neural network architecture:
-  Input (2) → Hidden layer (8 neurons, ReLU) → Output (1, Sigmoid)
-
-Key concepts demonstrated:
-  - Module composition (building blocks)
-  - Non-linear activation functions (ReLU, Sigmoid)
-  - Adam optimizer for better convergence
-  - Decision boundary visualization
+  - ``dnp.Sequential`` + layer-based activations (``dnp.ReLU``, ``dnp.Sigmoid``)
+  - ``dnp.BCELoss`` loss module
+  - ``dnp.Trainer`` high-level training loop with callbacks
+  - ``dnp.EarlyStopping`` to avoid over-training
+  - ``session.no_grad()`` for side-effect-free inference
 """
 
 import sys
@@ -25,32 +21,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import dnp
-from dnp.core.tensor import Tensor
 from dnp.core.session import session
-from dnp.layers import Module, Linear
-from dnp.core.optimizers import Adam
 
-
-class XORNetwork(Module):
-    """
-    Neural network to solve the XOR problem.
-
-    Architecture:
-      Input (2) → Linear(8) → ReLU → Linear(1) → Sigmoid
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.fc1 = Linear(2, 8, name="Hidden")
-        self.fc2 = Linear(8, 1, name="Output")
-
-    def forward(self, x):
-        """Forward pass through the network."""
-        h = self.fc1(x)
-        h = dnp.ops.relu(h)
-        out = self.fc2(h)
-        out = dnp.ops.sigmoid(out)
-        return out
+# Use top-level exports (v3)
+Tensor = dnp.Tensor
 
 
 def main():
@@ -66,83 +40,79 @@ def main():
     X_data = np.array(
         [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]], dtype=np.float64
     )
-
     Y_data = np.array([[0.0], [1.0], [1.0], [0.0]], dtype=np.float64)
-
-    X_tensor = Tensor(X_data, name="Input")
-    Y_tensor = Tensor(Y_data, name="Target")
 
     print(f"  Data points:")
     for i in range(len(X_data)):
         print(f"    X{i} = {X_data[i]} → Y{i} = {Y_data[i, 0]:.0f}")
 
     # ========================================
-    # 2. MODEL INITIALIZATION
+    # 2. MODEL — v3: dnp.Sequential with layer activations
     # ========================================
-    print("\n2. Initializing neural network...")
+    print("\n2. Initializing neural network (Sequential)...")
 
     np.random.seed(42)
-    model = XORNetwork()
+    model = dnp.Sequential(
+        dnp.Linear(2, 8, name="Hidden"),
+        dnp.ReLU(),
+        dnp.Linear(8, 1, name="Output"),
+        dnp.Sigmoid(),
+    )
 
-    print("  Architecture: 2 → [Dense(8, ReLU)] → Dense(1, Sigmoid)")
-
+    print("  Architecture: 2 → Linear(8) → ReLU → Linear(1) → Sigmoid")
     param_count = sum(p.size for p in model.parameters())
     print(f"  Total parameters: {param_count}")
 
     # ========================================
-    # 3. OPTIMIZER SETUP
+    # 3. LOSS, OPTIMIZER, CALLBACKS  (v3)
     # ========================================
-    print("\n3. Setting up optimizer...")
+    print("\n3. Setting up training components...")
 
-    optimizer = Adam(model.parameters(), lr=0.05, beta1=0.9, beta2=0.999)
+    criterion = dnp.BCELoss()
+    optimizer = dnp.Adam(model.parameters(), lr=0.05)
+    early_stop = dnp.EarlyStopping(monitor="loss", patience=50, verbose=True)
+
+    print(f"  Loss:      BCELoss")
     print(f"  Optimizer: Adam (lr=0.05)")
+    print(f"  Callback:  EarlyStopping (patience=50)")
+
+    # Capture computation graph before training starts
+    out_path = (
+        Path(__file__).parent.parent.parent
+        / "figures"
+        / "example_2_xor_problem"
+        / "computation_graph.png"
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with session.graph():
+        _p = model(Tensor(X_data, name="Input"))
+    session.show_graphe(title="XOR Problem Graph", save=True, filename=str(out_path))
 
     # ========================================
-    # 4. TRAINING LOOP
+    # 4. TRAINING — v3: Trainer.fit()
     # ========================================
-    print("\n4. Training the model...")
+    print("\n4. Training the model (Trainer.fit)...")
 
-    epochs = 500
-    loss_history = []
+    trainer = dnp.Trainer(
+        model,
+        optimizer,
+        loss_fn=lambda y_pred, y_true: criterion(y_pred, y_true),
+        callbacks=[early_stop],
+        verbose=True,
+    )
 
-    for epoch in range(epochs):
-        # Reset computation graph
-        session.reset()
-        optimizer.zero_grad()
+    history = trainer.fit(X_data, Y_data, epochs=500, batch_size=4, shuffle=False)
+    loss_history = history.history["loss"]
 
-        # --- Forward Pass ---
-        pred = model(X_tensor)
-
-        # MSE Loss
-        diff = dnp.ops.subtract(pred, Y_tensor)
-        loss = dnp.ops.mean(dnp.ops.square(diff))
-
-        # --- Backward Pass ---
-        loss.backward()
-
-        # --- Optimizer Step ---
-        optimizer.step()
-
-        loss_history.append(float(np.asarray(loss)))
-
-        if (epoch + 1) % 100 == 0:
-            print(f"  Epoch {epoch + 1:3d}/{epochs} | Loss: {loss.item():.6f}")
-
-        if epoch == 0:
-            out_path = Path(__file__).parent.parent.parent / "figures" / "example_2_xor_problem" / "computation_graph.png"
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            session.show_graphe(title="XOR Problem Graph", save=True, filename=str(out_path))
-
-    print("\n5. Training complete!")
-    print(f"  Final loss: {loss_history[-1]:.6f}\n")
+    print(f"\n5. Training complete!  Final loss: {loss_history[-1]:.6f}\n")
 
     # ========================================
-    # 5. EVALUATION
+    # 5. EVALUATION — v3: session.no_grad()
     # ========================================
     print("6. Evaluating on training data...")
 
-    session.reset()
-    final_pred = model(X_tensor)
+    with session.no_grad():
+        final_pred = model(Tensor(X_data, name="Input"))
 
     print("  Predictions (should be close to [0, 1, 1, 0]):")
     final_pred_data = np.asarray(final_pred).flatten()
@@ -160,8 +130,8 @@ def main():
     xx, yy = np.meshgrid(np.linspace(-0.5, 1.5, 200), np.linspace(-0.5, 1.5, 200))
     grid = np.c_[xx.ravel(), yy.ravel()]
 
-    session.reset()
-    grid_pred = model(Tensor(grid, name="Grid"))
+    with session.no_grad():
+        grid_pred = model(Tensor(grid, name="Grid"))
     Z = np.asarray(grid_pred).reshape(xx.shape)
 
     # Create comprehensive figure
@@ -289,9 +259,7 @@ def main():
 
     # Training dynamics
     ax = axes[1, 1]
-    sample_idx = 0
-    session.reset()
-    # Simulate predictions at different epochs (using final model)
+    # Display final predictions per sample
     ax.barh(
         ["X[0,0]→0", "X[0,1]→1", "X[1,0]→1", "X[1,1]→0"],
         predictions.tolist(),

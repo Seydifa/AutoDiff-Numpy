@@ -82,7 +82,13 @@ class Module:
       ``self.parameters()`` (if trainable).  Non-trainable weights are stored
       in ``_buffers`` and not returned by ``parameters()``.
     * ``_buffers`` dict for non-trainable persistent state (e.g. running stats).
+    * Each instance gets a unique ``_instance_name`` (e.g. ``'Linear_0'``,
+      ``'Linear_1'``) so weights from different layers of the same type
+      never share the same tensor name in the computation graph.
     """
+
+    # Class-level counter: {class_name: count} — gives each instance a unique index.
+    _instance_counters: dict = {}
 
     def __init__(self):
         # Use __dict__ directly to avoid triggering __setattr__ recursively.
@@ -90,6 +96,14 @@ class Module:
         self.__dict__["_nontrainable"] = {}  # non-trainable tensors
         self.__dict__["_buffers"] = {}  # plain arrays (not Tensors)
         self.__dict__["_modules"] = {}
+        self.__dict__["training"] = True
+        # Assign a unique name (e.g. "Linear_0", "Linear_1") per instance so
+        # weights registered via add_weight() get distinct tensor names in the
+        # computation graph even when multiple layers share the same class.
+        cls_name = self.__class__.__name__
+        idx = Module._instance_counters.get(cls_name, -1) + 1
+        Module._instance_counters[cls_name] = idx
+        self.__dict__["_instance_name"] = f"{cls_name}_{idx}"
 
     # ------------------------------------------------------------------
     # weight registration API
@@ -139,7 +153,7 @@ class Module:
         else:
             data = _apply_initializer(initializer, shape, _dtype)
 
-        w = Tensor(data, name=f"{self.__class__.__name__}.{name}")
+        w = Tensor(data, name=f"{self._instance_name}.{name}")
         object.__setattr__(self, name, w)
         if trainable:
             self._parameters[name] = w
@@ -153,8 +167,13 @@ class Module:
 
     def __setattr__(self, name, value):
         if isinstance(value, Tensor):
-            # Registered via add_weight? Don't double-register.
-            if name not in self._parameters and name not in self._nontrainable:
+            if name in self._parameters:
+                # Keep _parameters in sync when an existing weight is reassigned.
+                self._parameters[name] = value
+            elif name in self._nontrainable:
+                self._nontrainable[name] = value
+            else:
+                # New tensor — register as a trainable parameter.
                 self._parameters[name] = value
         elif isinstance(value, Module):
             self._modules[name] = value
@@ -274,12 +293,13 @@ class Linear(Module):
 
         std = np.sqrt(2.0 / (in_features + out_features))
 
-        self.W = Tensor(
-            np.random.randn(in_features, out_features) * std,
-            name=f"{self.name}_Poids",
+        self.W = self.add_weight(
+            "W",
+            shape=(in_features, out_features),
+            initializer=lambda s: np.random.randn(*s) * std,
         )
         if bias:
-            self.b = Tensor(np.zeros(out_features), name=f"{self.name}_Biais")
+            self.b = self.add_weight("b", shape=(out_features,), initializer="zeros")
         else:
             self.b = None
 
@@ -323,12 +343,13 @@ class Conv2d(Module):
         kH, kW = self.kernel_size
         std = np.sqrt(2.0 / (in_channels * kH * kW))
 
-        self.W = Tensor(
-            np.random.randn(out_channels, in_channels, kH, kW) * std,
-            name="Conv2d_poids",
+        self.W = self.add_weight(
+            "W",
+            shape=(out_channels, in_channels, kH, kW),
+            initializer=lambda s: np.random.randn(*s) * std,
         )
         if bias:
-            self.b = Tensor(np.zeros(out_channels), name="Conv2d_biais")
+            self.b = self.add_weight("b", shape=(out_channels,), initializer="zeros")
         else:
             self.b = None
 
@@ -495,8 +516,12 @@ class BatchNorm1d(Module):
         self.momentum = momentum
         self.training = True
 
-        self.weight = Tensor(np.ones(num_features), name="BN1d.weight")  # γ
-        self.bias = Tensor(np.zeros(num_features), name="BN1d.bias")  # β
+        self.weight = self.add_weight(
+            "weight", shape=(num_features,), initializer="ones"
+        )  # γ
+        self.bias = self.add_weight(
+            "bias", shape=(num_features,), initializer="zeros"
+        )  # β
 
         self.running_mean = np.zeros(num_features, dtype=get_dtype())
         self.running_var = np.ones(num_features, dtype=get_dtype())
@@ -533,8 +558,12 @@ class BatchNorm2d(Module):
         self.momentum = momentum
         self.training = True
 
-        self.weight = Tensor(np.ones(num_features), name="BN2d.weight")  # γ
-        self.bias = Tensor(np.zeros(num_features), name="BN2d.bias")  # β
+        self.weight = self.add_weight(
+            "weight", shape=(num_features,), initializer="ones"
+        )  # γ
+        self.bias = self.add_weight(
+            "bias", shape=(num_features,), initializer="zeros"
+        )  # β
 
         self.running_mean = np.zeros(num_features, dtype=get_dtype())
         self.running_var = np.ones(num_features, dtype=get_dtype())
@@ -575,10 +604,10 @@ class LayerNorm(Module):
     def __init__(self, ndim, bias=True, eps=1e-5):
         super().__init__()
         self.eps = eps
-        self.gamma = Tensor(np.ones(ndim), name="LN_gamma")
+        self.gamma = self.add_weight("gamma", shape=(ndim,), initializer="ones")
         self.use_bias = bias
         if bias:
-            self.beta = Tensor(np.zeros(ndim), name="LN_beta")
+            self.beta = self.add_weight("beta", shape=(ndim,), initializer="zeros")
 
     def forward(self, x: Tensor) -> Tensor:
         mean = ops.mean(x, axis=-1, keepdims=True)
@@ -668,7 +697,7 @@ class ScaledDotProductAttention(Module):
             output: (..., seq_len_q, d_v)
         """
         # Transpose last two dims of key — stays in the graph via ops.transpose.
-        ndim = key.data.ndim
+        ndim = len(key.shape)
         axes = list(range(ndim))
         axes[-1], axes[-2] = axes[-2], axes[-1]
         key_T = ops.transpose(key, axes=tuple(axes))
@@ -786,7 +815,8 @@ class CrossEntropyLoss(Module):
         # Use Python float — avoids adding a spurious leaf Tensor node each forward call.
         log_probs = ops.log(probs + 1e-8)
 
-        one_hot = np.eye(V)[targets_np]  # float64
+        xp = get_xp(logits_flat.data)
+        one_hot = xp.eye(V, dtype=get_dtype())[xp.asarray(targets_np)]
         t_one_hot = Tensor(one_hot)
 
         selected = log_probs * t_one_hot
@@ -819,7 +849,9 @@ class MSELoss(Module):
             )
         self.reduction = reduction
 
-    def forward(self, y_pred: Tensor, y_true: Tensor) -> Tensor:
+    def forward(self, y_pred: Tensor, y_true) -> Tensor:
+        if not isinstance(y_true, Tensor):
+            y_true = Tensor(y_true)
         diff = y_pred - y_true
         sq = ops.square(diff)
         if self.reduction == "mean":
@@ -851,7 +883,9 @@ class BCELoss(Module):
             )
         self.reduction = reduction
 
-    def forward(self, y_pred: Tensor, y_true: Tensor) -> Tensor:
+    def forward(self, y_pred: Tensor, y_true) -> Tensor:
+        if not isinstance(y_true, Tensor):
+            y_true = Tensor(y_true)
         # Clamp via log — add small epsilon to avoid log(0)
         eps = 1e-8
         pos = y_true * ops.log(y_pred + eps)
@@ -896,7 +930,9 @@ class BCEWithLogitsLoss(Module):
             )
         self.reduction = reduction
 
-    def forward(self, logits: Tensor, y_true: Tensor) -> Tensor:
+    def forward(self, logits: Tensor, y_true) -> Tensor:
+        if not isinstance(y_true, Tensor):
+            y_true = Tensor(y_true)
         # Numerically stable: max(x,0) - x*y + log(1 + exp(-|x|))
         relu_x = ops.relu(logits)
         abs_x = ops.absolute(logits)

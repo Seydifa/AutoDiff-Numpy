@@ -81,7 +81,7 @@ def graph_fn(func):
             if hasattr(v, "shape") and hasattr(v, "dtype"):
                 xp = get_xp(v)
                 if xp is not None:
-                    return Tensor(v, name="input")
+                    return Tensor(v, name=f"{func.__name__}_in")
             return v  # leave int, float, bool, tuple, str, etc. unchanged
 
         new_args = tuple(_to_tensor(a) for a in args)

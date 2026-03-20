@@ -2,15 +2,14 @@
 Example 1: Learning a Sobel Filter for Edge Detection
 =======================================================
 
-This example demonstrates learning a 2D convolution filter using automatic differentiation.
-The model learns to detect edges in images by optimizing a filter to approximate the Sobel operator.
+This example demonstrates learning a 2D convolution filter using automatic
+differentiation.  It showcases the v3 features:
 
-The computation graph tracks:
-  - The input image
-  - The learned filter parameters
-  - The convolution operation
-  - The loss computation
-  - Backward passes through all operations
+  - ``dnp.Tensor`` / ``dnp.session`` imported directly from top-level
+  - ``session.graph()`` context manager for clean per-step memory management
+  - ``session.no_grad()`` for side-effect-free evaluation
+  - ``dnp.MSELoss`` module instead of manual loss arithmetic
+  - ``dnp.graph_fn`` to auto-promote raw arrays to Tensors
 """
 
 import sys
@@ -22,9 +21,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import dnp
-from dnp.core.tensor import Tensor
 from dnp.core.session import session
 from scipy.signal import convolve2d
+
+# Use Tensor from the top-level namespace (v3 export)
+Tensor = dnp.Tensor
 
 
 def sobel_filter_y():
@@ -93,7 +94,12 @@ def main():
     print(f"  Initial filter:\n{np.round(W_learned.data, 3)}\n")
 
     # ========================================
-    # 3. TRAINING LOOP
+    # 3. LOSS FUNCTION  (v3: use MSELoss module)
+    # ========================================
+    criterion = dnp.MSELoss()
+
+    # ========================================
+    # 4. TRAINING LOOP
     # ========================================
     print("3. Training (learning the filter)...")
 
@@ -102,25 +108,16 @@ def main():
     loss_history = []
 
     for epoch in range(epochs):
-        # Reset computation graph to save memory
-        session.reset()
-
-        # --- Forward Pass ---
-        # Convolution: pred = conv2d(X, W)
-        # Use scipy convolve2d for the forward pass
-        pred = dnp.ops.conv2d(X_tensor, W_learned, mode="valid")
-
-        # MSE Loss: L = mean((pred - target)^2)
-        diff = dnp.ops.subtract(pred, Y_tensor)
-        diff_sq = dnp.ops.square(diff)
-        loss = dnp.ops.mean(diff_sq)
+        # v3: session.graph() resets the graph at every step → no memory leak
+        with session.graph():
+            pred = dnp.ops.conv2d(X_tensor, W_learned, mode="valid")
+            loss = criterion(pred, Y_tensor)
 
         # --- Backward Pass ---
         W_learned.grad.fill(0.0)
         loss.backward()
 
-        # Capture the computation graph at epoch 0, before the parameter
-        # is recreated (which would add a disconnected node to the session).
+        # Capture computation graph at epoch 0
         if epoch == 0:
             out_path = (
                 Path(__file__).parent.parent.parent
@@ -134,7 +131,6 @@ def main():
             )
 
         # --- Gradient Update (SGD) ---
-        # Update the underlying data directly
         updated_data = np.asarray(W_learned) - learning_rate * W_learned.grad
         W_learned = Tensor(updated_data, name="LearnedFilter")
 
@@ -143,8 +139,11 @@ def main():
         if (epoch + 1) % 50 == 0:
             print(f"  Epoch {epoch + 1:3d}/{epochs} | Loss: {loss.item():.6f}")
 
-    session.reset()
-    final_pred = convolve2d(X_img, W_learned.data, mode="valid")
+    # ========================================
+    # 5. FINAL EVALUATION  (v3: session.no_grad())
+    # ========================================
+    with session.no_grad():
+        final_pred = convolve2d(X_img, W_learned.data, mode="valid")
 
     # Create figure with 5 subplots
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))

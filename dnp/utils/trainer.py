@@ -397,9 +397,13 @@ class Trainer:
                 # ReduceLROnPlateau needs the metric value
                 monitor_val = logs.get("val_loss", avg_loss)
                 try:
-                    self.scheduler.step(metrics=monitor_val)
+                    # Try ReduceLROnPlateau-style (positional metric)
+                    self.scheduler.step(monitor_val)
                 except TypeError:
-                    self.scheduler.step()
+                    try:
+                        self.scheduler.step()
+                    except TypeError:
+                        pass
 
             stop = self._call_callbacks("on_epoch_end", epoch, logs)
             if stop:
@@ -514,24 +518,24 @@ class History:
 
 def _copy_weights(model) -> list:
     """Return a deep copy of all parameter arrays."""
-    return [p.data.copy() for p in model.parameters]
+    return [p.data.copy() for p in model.parameters()]
 
 
 def _restore_weights(model, weights: list) -> None:
     """Overwrite parameter arrays with *weights* (in the same order)."""
-    for p, w in zip(model.parameters, weights):
+    for p, w in zip(model.parameters(), weights):
         p[...] = w
 
 
 def _save_model(model, path: str) -> None:
     """Save model to *path* as ``.pkl`` or ``.npz``."""
     if path.endswith(".npz"):
-        arrays = {f"param_{i}": p.data for i, p in enumerate(model.parameters)}
+        arrays = {f"param_{i}": p.data for i, p in enumerate(model.parameters())}
         np.savez(path, **arrays)
     else:
         with open(path, "wb") as fh:
             pickle.dump(
-                {"weights": [p.data for p in model.parameters]},
+                {"weights": [p.data for p in model.parameters()]},
                 fh,
                 protocol=pickle.HIGHEST_PROTOCOL,
             )
@@ -541,10 +545,10 @@ def _load_model(model, path: str) -> None:
     """Load model weights from *path*."""
     if path.endswith(".npz"):
         data = np.load(path)
-        for i, p in enumerate(model.parameters):
+        for i, p in enumerate(model.parameters()):
             p[...] = data[f"param_{i}"]
     else:
         with open(path, "rb") as fh:
             checkpoint = pickle.load(fh)
-        for p, w in zip(model.parameters, checkpoint["weights"]):
+        for p, w in zip(model.parameters(), checkpoint["weights"]):
             p[...] = w
