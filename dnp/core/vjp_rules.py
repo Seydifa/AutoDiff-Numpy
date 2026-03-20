@@ -9,14 +9,88 @@ This is the single source of truth — previously split across dnp/ops/vjp_rules
 
 # Third-party libraries
 import numpy as np
-from scipy.signal import convolve2d
+import numba
+
+from .backend import get_xp, as_numpy
 
 EPSILON = 1e-8
 
 # ---------------------------------------------------------------------------
-# Broadcasting utility
+# Numba-optimized Kernels (CPU bound, so input needs to be transferred)
 # ---------------------------------------------------------------------------
 
+@numba.njit(cache=True)
+def _max_pool2d_backward_kernel(g, x_padded, kH, kW, sH, sW, H_out, W_out):
+    batch, channels, _, _ = x_padded.shape
+    grad_x = np.zeros_like(x_padded)
+    for b in range(batch):
+        for c in range(channels):
+            for i in range(H_out):
+                for j in range(W_out):
+                    h_start = i * sH
+                    h_end = h_start + kH
+                    w_start = j * sW
+                    w_end = w_start + kW
+                    
+                    max_val = -1e30 
+                    for wh in range(h_start, h_end):
+                        for ww in range(w_start, w_end):
+                            if x_padded[b, c, wh, ww] > max_val:
+                                max_val = x_padded[b, c, wh, ww]
+                    
+                    for wh in range(h_start, h_end):
+                        for ww in range(w_start, w_end):
+                            if x_padded[b, c, wh, ww] == max_val:
+                                grad_x[b, c, wh, ww] += g[b, c, i, j]
+    return grad_x
+
+
+@numba.njit(cache=True)
+def _avg_pool2d_backward_kernel(g, x_padded, kH, kW, sH, sW, H_out, W_out):
+    batch, channels, _, _ = x_padded.shape
+    grad_x = np.zeros_like(x_padded)
+    pool_size = kH * kW
+    for b in range(batch):
+        for c in range(channels):
+            for i in range(H_out):
+                for j in range(W_out):
+                    h_start = i * sH
+                    h_end = h_start + kH
+                    w_start = j * sW
+                    w_end = w_start + kW
+                    
+                    val = g[b, c, i, j] / pool_size
+                    for wh in range(h_start, h_end):
+                        for ww in range(w_start, w_end):
+                            grad_x[b, c, wh, ww] += val
+    return grad_x
+
+
+@numba.njit(cache=True)
+def _conv2d_forward_kernel(x_padded, W, stride_h, stride_w, H_out, W_out):
+    batch_size, in_channels, _, _ = x_padded.shape
+    out_channels, _, kH, kW = W.shape
+    y = np.zeros((batch_size, out_channels, H_out, W_out), dtype=x_padded.dtype)
+    
+    for b in range(batch_size):
+        for oc in range(out_channels):
+            for ic in range(in_channels):
+                for i in range(H_out):
+                    h_start = i * stride_h
+                    for j in range(W_out):
+                        w_start = j * stride_w
+                        
+                        sum_val = 0.0
+                        for kh in range(kH):
+                            for kw in range(kW):
+                                sum_val += x_padded[b, ic, h_start + kh, w_start + kw] * W[oc, ic, kh, kw]
+                        y[b, oc, i, j] += sum_val
+    return y
+
+
+# ---------------------------------------------------------------------------
+# Broadcasting utility
+# ---------------------------------------------------------------------------
 
 def unbroadcast(grad, target_shape):
     """Sum gradient axes that were broadcast-expanded, restoring target_shape."""
@@ -30,224 +104,164 @@ def unbroadcast(grad, target_shape):
             grad = grad.sum(axis=i, keepdims=True)
     return grad
 
-
 # ---------------------------------------------------------------------------
 # Activation / helper functions (also serve as forward-pass callables)
 # ---------------------------------------------------------------------------
 
-
 def sigmoid(x):
-    x_clipped = np.clip(x, -500, 500)
-    return 1.0 / (1.0 + np.exp(-x_clipped))
-
+    xp = get_xp(x)
+    x_clipped = xp.clip(x, -500, 500)
+    return 1.0 / (1.0 + xp.exp(-x_clipped))
 
 def relu(x):
-    return np.maximum(0.0, x)
-
+    xp = get_xp(x)
+    return xp.maximum(0.0, x)
 
 def leaky_relu(x, alpha=0.01):
-    return np.where(x > 0, x, alpha * x)
-
+    xp = get_xp(x)
+    return xp.where(x > 0, x, alpha * x)
 
 def elu(x, alpha=1.0):
-    return np.where(x > 0, x, alpha * (np.exp(x) - 1.0))
-
+    xp = get_xp(x)
+    return xp.where(x > 0, x, alpha * (xp.exp(x) - 1.0))
 
 def softplus(x):
-    x_clipped = np.clip(x, -500, 500)
-    return np.log(1.0 + np.exp(x_clipped))
-
+    xp = get_xp(x)
+    x_clipped = xp.clip(x, -500, 500)
+    return xp.log(1.0 + xp.exp(x_clipped))
 
 def swish(x):
     return x * sigmoid(x)
 
-
 def gelu(x):
-    const1 = np.sqrt(2.0 / np.pi)
+    xp = get_xp(x)
+    const1 = xp.sqrt(2.0 / xp.pi)
     const2 = 0.044715
-    return 0.5 * x * (1.0 + np.tanh(const1 * (x + const2 * np.power(x, 3))))
-
+    return 0.5 * x * (1.0 + xp.tanh(const1 * (x + const2 * xp.power(x, 3))))
 
 def softmax(x, axis=-1):
-    x_max = np.max(x, axis=axis, keepdims=True)
-    e_x = np.exp(x - x_max)
-    return e_x / np.sum(e_x, axis=axis, keepdims=True)
-
+    xp = get_xp(x)
+    x_max = xp.max(x, axis=axis, keepdims=True)
+    e_x = xp.exp(x - x_max)
+    return e_x / xp.sum(e_x, axis=axis, keepdims=True)
 
 # ---------------------------------------------------------------------------
-# Pooling operations (vectorized)
+# Pooling operations (vectorized fallback or cpu bound logic where necessary)
 # ---------------------------------------------------------------------------
-
 
 def max_pool2d(x, kernel_size, stride=1, padding=0):
-    """
-    Vectorized 2D max pooling.
+    xp = get_xp(x)
+    is_cupy = (xp.__name__ == 'cupy')
+    if is_cupy:
+        x_np = as_numpy(x)
+    else:
+        x_np = x
 
-    Args:
-        x: (batch, channels, height, width)
-        kernel_size: int or tuple (kH, kW)
-        stride: int or tuple (sH, sW)
-        padding: int
-    Returns:
-        output: (batch, channels, height_out, width_out)
-    """
     if isinstance(kernel_size, int):
         kernel_size = (kernel_size, kernel_size)
     if isinstance(stride, int):
         stride = (stride, stride)
 
-    batch, channels, H, W = x.shape
+    batch, channels, H, W = x_np.shape
     kH, kW = kernel_size
     sH, sW = stride
 
-    # Pad if necessary
     if padding > 0:
-        x = np.pad(x, ((0, 0), (0, 0), (padding, padding), (padding, padding)))
-        H, W = x.shape[2:]
+        x_np = np.pad(x_np, ((0, 0), (0, 0), (padding, padding), (padding, padding)))
+        H, W = x_np.shape[2:]
 
-    # Calculate output shape
     H_out = (H - kH) // sH + 1
     W_out = (W - kW) // sW + 1
 
-    # Use stride tricks for vectorization
-    strides = x.strides
-    shape = (
-        batch,
-        channels,
-        H_out,
-        W_out,
-        kH,
-        kW,
-    )
-    strides = (
-        strides[0],
-        strides[1],
-        sH * strides[2],
-        sW * strides[3],
-        strides[2],
-        strides[3],
-    )
+    strides = x_np.strides
+    shape = (batch, channels, H_out, W_out, kH, kW)
+    strides = (strides[0], strides[1], sH * strides[2], sW * strides[3], strides[2], strides[3])
 
-    x_windowed = np.lib.stride_tricks.as_strided(x, shape=shape, strides=strides)
-    return np.max(x_windowed, axis=(4, 5))
+    x_windowed = np.lib.stride_tricks.as_strided(x_np, shape=shape, strides=strides)
+    out = np.max(x_windowed, axis=(4, 5))
 
+    if is_cupy:
+        return xp.asarray(out)
+    return out
 
 def avg_pool2d(x, kernel_size, stride=1, padding=0):
-    """
-    Vectorized 2D average pooling.
+    xp = get_xp(x)
+    is_cupy = (xp.__name__ == 'cupy')
+    if is_cupy:
+        x_np = as_numpy(x)
+    else:
+        x_np = x
 
-    Args:
-        x: (batch, channels, height, width)
-        kernel_size: int or tuple (kH, kW)
-        stride: int or tuple (sH, sW)
-        padding: int
-    Returns:
-        output: (batch, channels, height_out, width_out)
-    """
     if isinstance(kernel_size, int):
         kernel_size = (kernel_size, kernel_size)
     if isinstance(stride, int):
         stride = (stride, stride)
 
-    batch, channels, H, W = x.shape
+    batch, channels, H, W = x_np.shape
     kH, kW = kernel_size
     sH, sW = stride
 
-    # Pad if necessary
     if padding > 0:
-        x = np.pad(x, ((0, 0), (0, 0), (padding, padding), (padding, padding)))
-        H, W = x.shape[2:]
+        x_np = np.pad(x_np, ((0, 0), (0, 0), (padding, padding), (padding, padding)))
+        H, W = x_np.shape[2:]
 
-    # Calculate output shape
     H_out = (H - kH) // sH + 1
     W_out = (W - kW) // sW + 1
 
-    # Use stride tricks for vectorization
-    strides = x.strides
-    shape = (
-        batch,
-        channels,
-        H_out,
-        W_out,
-        kH,
-        kW,
-    )
-    strides = (
-        strides[0],
-        strides[1],
-        sH * strides[2],
-        sW * strides[3],
-        strides[2],
-        strides[3],
-    )
+    strides = x_np.strides
+    shape = (batch, channels, H_out, W_out, kH, kW)
+    strides = (strides[0], strides[1], sH * strides[2], sW * strides[3], strides[2], strides[3])
 
-    x_windowed = np.lib.stride_tricks.as_strided(x, shape=shape, strides=strides)
-    return np.mean(x_windowed, axis=(4, 5))
-
+    x_windowed = np.lib.stride_tricks.as_strided(x_np, shape=shape, strides=strides)
+    out = np.mean(x_windowed, axis=(4, 5))
+    if is_cupy:
+        return xp.asarray(out)
+    return out
 
 def dropout(x, p=0.5, training=True):
-    """
-    Dropout regularization.
-
-    Args:
-        x: input tensor
-        p: dropout probability
-        training: if True, apply dropout; if False, return x unchanged
-    Returns:
-        output: x with dropout applied (scaled by 1/(1-p))
-    """
     if not training or p == 0:
         return x
-    mask = np.random.binomial(1, 1 - p, size=x.shape)
+    xp = get_xp(x)
+    mask = xp.random.binomial(1, 1 - p, size=x.shape)
     return x * mask / (1 - p)
 
-
 def batch_norm(x, weight, bias, mean, var, eps=1e-5):
-    """
-    Batch normalization: (x - mean) / sqrt(var + eps) * weight + bias
-
-    Args:
-        x: input tensor
-        weight: scale parameter (gamma)
-        bias: shift parameter (beta)
-        mean: batch mean
-        var: batch variance
-        eps: epsilon for numerical stability
-    Returns:
-        output: normalized tensor
-    """
-    x_norm = (x - mean) / np.sqrt(var + eps)
+    xp = get_xp(x)
+    x_norm = (x - mean) / xp.sqrt(var + eps)
     return weight * x_norm + bias
-
 
 # ---------------------------------------------------------------------------
 # Convolution helpers
 # ---------------------------------------------------------------------------
 
-
 def conv2d(x, w, mode="valid"):
-    """2D convolution using scipy.signal.convolve2d."""
-    return convolve2d(x, w, mode=mode)
-
+    """2D convolution using scipy/cupyx."""
+    xp = get_xp(x)
+    if xp.__name__ == 'cupy':
+        # Fallback to scipy or cupyx if available
+        try:
+            from cupyx.scipy.signal import convolve2d as cp_convolve2d
+            return cp_convolve2d(x, w, mode=mode)
+        except ImportError:
+            from scipy.signal import convolve2d as sp_convolve2d
+            res = sp_convolve2d(as_numpy(x), as_numpy(w), mode=mode)
+            return xp.asarray(res)
+    else:
+        from scipy.signal import convolve2d as sp_convolve2d
+        return sp_convolve2d(x, w, mode=mode)
 
 def rot180(w):
-    """Rotate kernel 180° (equivalent to flipping both axes)."""
-    return np.rot90(w, 2)
-
+    xp = get_xp(w)
+    return xp.rot90(w, 2)
 
 def conv2d_full(g, w):
-    """Full convolution used for gradient calculation."""
-    return convolve2d(g, w, mode="full")
-
+    return conv2d(g, w, mode="full")
 
 # ---------------------------------------------------------------------------
 # VJP Rules dictionary
 # ---------------------------------------------------------------------------
 
 VJP_RULES = {
-    # ======================================================================
-    # 1. BINARY OPERATIONS  (broadcasting handled via unbroadcast)
-    # ======================================================================
     np.add: lambda g, x, y: (unbroadcast(g, x.shape), unbroadcast(g, y.shape)),
     np.subtract: lambda g, x, y: (unbroadcast(g, x.shape), unbroadcast(-g, y.shape)),
     np.multiply: lambda g, x, y: (
@@ -259,8 +273,8 @@ VJP_RULES = {
         unbroadcast(-g * x / (y**2 + EPSILON), y.shape),
     ),
     np.power: lambda g, x, y: (
-        unbroadcast(g * y * np.power(x, y - 1), x.shape),
-        unbroadcast(g * np.power(x, y) * np.log(x + EPSILON), y.shape),
+        unbroadcast(g * y * get_xp(x).power(x, y - 1), x.shape),
+        unbroadcast(g * get_xp(x).power(x, y) * get_xp(x).log(x + EPSILON), y.shape),
     ),
     np.maximum: lambda g, x, y: (
         unbroadcast(g * (x >= y), x.shape),
@@ -270,252 +284,172 @@ VJP_RULES = {
         unbroadcast(g * (x <= y), x.shape),
         unbroadcast(g * (x > y), y.shape),
     ),
-    # ======================================================================
-    # 2. UNARY OPERATIONS
-    # ======================================================================
+    # Unary Operations
     np.negative: lambda g, x: (-g,),
     np.square: lambda g, x: (g * 2 * x,),
-    np.sqrt: lambda g, x: (g / (2 * np.sqrt(x) + EPSILON),),
-    np.exp: lambda g, x: (g * np.exp(x),),
+    np.sqrt: lambda g, x: (g / (2 * get_xp(x).sqrt(x) + EPSILON),),
+    np.exp: lambda g, x: (g * get_xp(x).exp(x),),
     np.log: lambda g, x: (g / (x + EPSILON),),
     np.log1p: lambda g, x: (g / (x + 1.0 + EPSILON),),
-    np.expm1: lambda g, x: (g * np.exp(x),),
-    np.abs: lambda g, x: (g * np.sign(x),),
-    np.sign: lambda g, x: (np.zeros_like(x),),  # 0 a.e.
-    # Trigonometry & Hyperbolic
-    np.sin: lambda g, x: (g * np.cos(x),),
-    np.cos: lambda g, x: (g * -np.sin(x),),
-    np.tan: lambda g, x: (g / (np.cos(x) ** 2 + EPSILON),),
-    np.sinh: lambda g, x: (g * np.cosh(x),),
-    np.cosh: lambda g, x: (g * np.sinh(x),),
-    np.tanh: lambda g, x: (g * (1 - np.tanh(x) ** 2),),
-    # Rounding (gradient is 0 a.e.)
-    np.floor: lambda g, x: (np.zeros_like(x),),
-    np.ceil: lambda g, x: (np.zeros_like(x),),
-    np.round: lambda g, x: (np.zeros_like(x),),
-    # ======================================================================
-    # 3. MATRIX OPERATIONS
-    # ======================================================================
+    np.expm1: lambda g, x: (g * get_xp(x).exp(x),),
+    np.abs: lambda g, x: (g * get_xp(x).sign(x),),
+    np.sign: lambda g, x: (get_xp(x).zeros_like(x),),
+    # Trig
+    np.sin: lambda g, x: (g * get_xp(x).cos(x),),
+    np.cos: lambda g, x: (g * -get_xp(x).sin(x),),
+    np.tan: lambda g, x: (g / (get_xp(x).cos(x) ** 2 + EPSILON),),
+    np.sinh: lambda g, x: (g * get_xp(x).cosh(x),),
+    np.cosh: lambda g, x: (g * get_xp(x).sinh(x),),
+    np.tanh: lambda g, x: (g * (1 - get_xp(x).tanh(x) ** 2),),
+    # Rounding
+    np.floor: lambda g, x: (get_xp(x).zeros_like(x),),
+    np.ceil: lambda g, x: (get_xp(x).zeros_like(x),),
+    np.round: lambda g, x: (get_xp(x).zeros_like(x),),
+    # Matrix operations
     np.matmul: lambda g, x, y: (
-        unbroadcast(np.matmul(g, np.swapaxes(y, -1, -2) if getattr(y, 'ndim', 0) >= 2 else y), x.shape),
-        unbroadcast(np.matmul(np.swapaxes(x, -1, -2) if getattr(x, 'ndim', 0) >= 2 else x, g), y.shape),
+        unbroadcast(get_xp(g).matmul(g, get_xp(y).swapaxes(y, -1, -2) if getattr(y, 'ndim', 0) >= 2 else y), x.shape),
+        unbroadcast(get_xp(g).matmul(get_xp(x).swapaxes(x, -1, -2) if getattr(x, 'ndim', 0) >= 2 else x, g), y.shape),
     ),
-    np.dot: lambda g, x, y: (np.dot(g, y.T), np.dot(x.T, g)),
-    # ======================================================================
-    # 4. REDUCTIONS  (axis + keepdims aware)
-    # ======================================================================
+    np.dot: lambda g, x, y: (get_xp(g).dot(g, y.T), get_xp(g).dot(x.T, g)),
+    # Reductions
     np.sum: lambda g, x, axis=None, keepdims=False: (
-        (g if keepdims else np.expand_dims(g, axis) if axis is not None else g)
-        * np.ones_like(x),
+        (g if keepdims else get_xp(g).expand_dims(g, axis) if axis is not None else g)
+        * get_xp(x).ones_like(x),
     ),
     np.mean: lambda g, x, axis=None, keepdims=False: (
         (
-            (g if keepdims else np.expand_dims(g, axis) if axis is not None else g)
-            * np.ones_like(x)
+            (g if keepdims else get_xp(g).expand_dims(g, axis) if axis is not None else g)
+            * get_xp(x).ones_like(x)
         )
-        / (np.prod(np.array(x.shape)[axis]) if axis is not None else np.size(x)),
+        / (get_xp(x).prod(get_xp(x).array(x.shape)[axis]) if axis is not None else x.size),
     ),
     np.prod: lambda g, x, axis=None, keepdims=False: (
-        (g if keepdims else np.expand_dims(g, axis) if axis is not None else g)
-        * (np.prod(x, axis=axis, keepdims=True) / (x + EPSILON)),
+        (g if keepdims else get_xp(g).expand_dims(g, axis) if axis is not None else g)
+        * (get_xp(x).prod(x, axis=axis, keepdims=True) / (x + EPSILON)),
     ),
     np.max: lambda g, x, axis=None, keepdims=False: (
-        (g if keepdims else np.expand_dims(g, axis) if axis is not None else g)
-        * (x == np.max(x, axis=axis, keepdims=True)),
+        (g if keepdims else get_xp(g).expand_dims(g, axis) if axis is not None else g)
+        * (x == get_xp(x).max(x, axis=axis, keepdims=True)),
     ),
     np.min: lambda g, x, axis=None, keepdims=False: (
-        (g if keepdims else np.expand_dims(g, axis) if axis is not None else g)
-        * (x == np.min(x, axis=axis, keepdims=True)),
+        (g if keepdims else get_xp(g).expand_dims(g, axis) if axis is not None else g)
+        * (x == get_xp(x).min(x, axis=axis, keepdims=True)),
     ),
-    # ======================================================================
-    # 5. SHAPE OPERATIONS
-    # ======================================================================
-    np.reshape: lambda g, x, newshape: (np.reshape(g, x.shape),),
+    # Shape operations
+    np.reshape: lambda g, x, newshape: (get_xp(g).reshape(g, x.shape),),
     np.transpose: lambda g, x, axes=None: (
-        np.transpose(g, np.argsort(axes)) if axes is not None else g.T,
+        get_xp(g).transpose(g, get_xp(g).argsort(axes)) if axes is not None else g.T,
     ),
-    np.expand_dims: lambda g, x, axis: (np.squeeze(g, axis),),
+    np.expand_dims: lambda g, x, axis: (get_xp(g).squeeze(g, axis),),
     np.squeeze: lambda g, x, axis=None: (
-        np.expand_dims(g, axis) if axis is not None else np.reshape(g, x.shape),
+        get_xp(g).expand_dims(g, axis) if axis is not None else get_xp(g).reshape(g, x.shape),
     ),
-    # ======================================================================
-    # 6. CUSTOM / NN OPS
-    # ======================================================================
+    # NN ops
     conv2d: lambda g, x, w, mode="valid": (
-        convolve2d(
-            g,
-            rot180(w),
-            mode="full" if mode == "valid" else "same" if mode == "same" else "valid",
-        ),
-        convolve2d(
-            x
-            if mode == "valid"
-            else np.pad(x, [(w.shape[0] // 2,) * 2, (w.shape[1] // 2,) * 2])
-            if mode == "same"
-            else np.pad(x, [(w.shape[0] - 1,) * 2, (w.shape[1] - 1,) * 2]),
-            g,
-            mode="valid",
+        conv2d(g, rot180(w), mode="full" if mode == "valid" else "same" if mode == "same" else "valid"),
+        conv2d(
+            x if mode == "valid" else
+            get_xp(x).pad(x, [(w.shape[0] // 2,) * 2, (w.shape[1] // 2,) * 2]) if mode == "same" else
+            get_xp(x).pad(x, [(w.shape[0] - 1,) * 2, (w.shape[1] - 1,) * 2]),
+            g, mode="valid"
         ),
     ),
     sigmoid: lambda g, x: (g * sigmoid(x) * (1.0 - sigmoid(x)),),
     relu: lambda g, x: (g * (x > 0).astype(x.dtype),),
-    leaky_relu: lambda g, x: (g * np.where(x > 0, 1.0, 0.01),),
-    elu: lambda g, x: (g * np.where(x > 0, 1.0, 1.0 * np.exp(x)),),
+    leaky_relu: lambda g, x: (g * get_xp(x).where(x > 0, 1.0, 0.01),),
+    elu: lambda g, x: (g * get_xp(x).where(x > 0, 1.0, 1.0 * get_xp(x).exp(x)),),
     softplus: lambda g, x: (g * sigmoid(x),),
     swish: lambda g, x: (g * (swish(x) + sigmoid(x) * (1.0 - swish(x))),),
     gelu: lambda g, x: (
-        g
-        * (
-            0.5 * (1.0 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * x**3)))
-            + 0.5
-            * x
-            * (1.0 - np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * x**3)) ** 2)
-            * np.sqrt(2 / np.pi)
-            * (1.0 + 3 * 0.044715 * x**2)
+        g * (
+            0.5 * (1.0 + get_xp(x).tanh(get_xp(x).sqrt(2 / get_xp(x).pi) * (x + 0.044715 * x**3)))
+            + 0.5 * x * (1.0 - get_xp(x).tanh(get_xp(x).sqrt(2 / get_xp(x).pi) * (x + 0.044715 * x**3)) ** 2)
+            * get_xp(x).sqrt(2 / get_xp(x).pi) * (1.0 + 3 * 0.044715 * x**2)
         ),
     ),
-    softmax: lambda g, x: (
-        g * softmax(x) - softmax(x) * np.sum(g * softmax(x), axis=-1, keepdims=True),
-    ),
-    # ======================================================================
-    # 7. POOLING OPERATIONS
-    # ======================================================================
-    max_pool2d: lambda g, x, kernel_size, stride=1, padding=0: (
-        # For max pooling: gradient flows only to the max element
-        _max_pool2d_backward(g, x, kernel_size, stride, padding),
-    ),
-    avg_pool2d: lambda g, x, kernel_size, stride=1, padding=0: (
-        # For avg pooling: gradient is uniform across the pooled region
-        _avg_pool2d_backward(g, x, kernel_size, stride, padding),
-    ),
-    # ======================================================================
-    # 8. REGULARIZATION OPERATIONS
-    # ======================================================================
-    dropout: lambda g, x, p=0.5, training=True: (
-        (g / (1 - p),) if training else (g,)
-    ),  # Gradient scaled by 1/(1-p) during training
-    # ======================================================================
-    # 9. NORMALIZATION OPERATIONS
-    # ======================================================================
-    batch_norm: lambda g, x, weight, bias, mean, var, eps=1e-5: (
-        _batch_norm_backward(g, x, weight, bias, mean, var, eps),
-    ),
+    softmax: lambda g, x: (g * softmax(x) - softmax(x) * get_xp(x).sum(g * softmax(x), axis=-1, keepdims=True),),
+    max_pool2d: lambda g, x, kernel_size, stride=1, padding=0: (_max_pool2d_backward(g, x, kernel_size, stride, padding),),
+    avg_pool2d: lambda g, x, kernel_size, stride=1, padding=0: (_avg_pool2d_backward(g, x, kernel_size, stride, padding),),
+    dropout: lambda g, x, p=0.5, training=True: ((g / (1 - p),) if training else (g,)),
+    batch_norm: lambda g, x, weight, bias, mean, var, eps=1e-5: (_batch_norm_backward(g, x, weight, bias, mean, var, eps),),
 }
 
-
 # ---------------------------------------------------------------------------
-# Backward pass helpers for pooling and normalization
+# Backward pass helpers
 # ---------------------------------------------------------------------------
-
 
 def _max_pool2d_backward(g, x, kernel_size, stride=1, padding=0):
-    """Backward pass for max pooling."""
+    xp = get_xp(x)
+    is_cpu = (xp.__name__ == 'numpy')
+    g_np, x_np = as_numpy(g), as_numpy(x)
+
     if isinstance(kernel_size, int):
         kernel_size = (kernel_size, kernel_size)
     if isinstance(stride, int):
         stride = (stride, stride)
 
-    batch, channels, H, W = x.shape
+    batch, channels, H, W = x_np.shape
     kH, kW = kernel_size
     sH, sW = stride
 
-    # Pad input if necessary
-    x_padded = x
     if padding > 0:
-        x_padded = np.pad(x, ((0, 0), (0, 0), (padding, padding), (padding, padding)))
+        x_padded = np.pad(x_np, ((0, 0), (0, 0), (padding, padding), (padding, padding)))
+    else:
+        x_padded = x_np
 
-    # Calculate output shape
-    H_padded = x_padded.shape[2]
-    W_padded = x_padded.shape[3]
+    H_padded, W_padded = x_padded.shape[2:]
     H_out = (H_padded - kH) // sH + 1
     W_out = (W_padded - kW) // sW + 1
 
-    # Initialize gradient for input
-    grad_x = np.zeros_like(x_padded)
-
-    # Backward pass: distribute gradient to max elements
-    for i in range(H_out):
-        for j in range(W_out):
-            h_start = i * sH
-            h_end = h_start + kH
-            w_start = j * sW
-            w_end = w_start + kW
-
-            window = x_padded[:, :, h_start:h_end, w_start:w_end]
-            max_vals = np.max(window, axis=(2, 3), keepdims=True)
-            mask = (window == max_vals).astype(x.dtype)
-            grad_x[:, :, h_start:h_end, w_start:w_end] += (
-                mask * g[:, :, i : i + 1, j : j + 1]
-            )
+    grad_x_padded = _max_pool2d_backward_kernel(g_np, x_padded, kH, kW, sH, sW, H_out, W_out)
 
     if padding > 0:
-        grad_x = grad_x[:, :, padding:-padding, padding:-padding]
+        grad_x = grad_x_padded[:, :, padding:-padding, padding:-padding]
+    else:
+        grad_x = grad_x_padded
 
-    return grad_x
-
+    return grad_x if is_cpu else xp.asarray(grad_x)
 
 def _avg_pool2d_backward(g, x, kernel_size, stride=1, padding=0):
-    """Backward pass for average pooling."""
+    xp = get_xp(x)
+    is_cpu = (xp.__name__ == 'numpy')
+    g_np, x_np = as_numpy(g), as_numpy(x)
+
     if isinstance(kernel_size, int):
         kernel_size = (kernel_size, kernel_size)
     if isinstance(stride, int):
         stride = (stride, stride)
 
-    batch, channels, H, W = x.shape
+    batch, channels, H, W = x_np.shape
     kH, kW = kernel_size
     sH, sW = stride
-    pool_size = kH * kW
 
-    # Pad input if necessary
-    x_padded = x
     if padding > 0:
-        x_padded = np.pad(x, ((0, 0), (0, 0), (padding, padding), (padding, padding)))
+        x_padded = np.pad(x_np, ((0, 0), (0, 0), (padding, padding), (padding, padding)))
+    else:
+        x_padded = x_np
 
-    # Calculate output shape
-    H_padded = x_padded.shape[2]
-    W_padded = x_padded.shape[3]
+    H_padded, W_padded = x_padded.shape[2:]
     H_out = (H_padded - kH) // sH + 1
     W_out = (W_padded - kW) // sW + 1
 
-    # Initialize gradient for input
-    grad_x = np.zeros_like(x_padded)
-
-    # Backward pass: distribute gradient uniformly to pooled region
-    for i in range(H_out):
-        for j in range(W_out):
-            h_start = i * sH
-            h_end = h_start + kH
-            w_start = j * sW
-            w_end = w_start + kW
-
-            grad_x[:, :, h_start:h_end, w_start:w_end] += (
-                g[:, :, i : i + 1, j : j + 1] / pool_size
-            )
+    grad_x_padded = _avg_pool2d_backward_kernel(g_np, x_padded, kH, kW, sH, sW, H_out, W_out)
 
     if padding > 0:
-        grad_x = grad_x[:, :, padding:-padding, padding:-padding]
+        grad_x = grad_x_padded[:, :, padding:-padding, padding:-padding]
+    else:
+        grad_x = grad_x_padded
 
-    return grad_x
-
+    return grad_x if is_cpu else xp.asarray(grad_x)
 
 def _batch_norm_backward(g, x, weight, bias, mean, var, eps=1e-5):
-    """
-    Backward pass for batch normalization.
-    Returns gradients for x only (weight and bias gradients computed separately).
-    """
-    # x_norm = (x - mean) / sqrt(var + eps)
-    x_norm = (x - mean) / np.sqrt(var + eps)
-
-    # dL/dx_norm = dL/dy * weight
+    xp = get_xp(x)
+    x_norm = (x - mean) / xp.sqrt(var + eps)
     grad_x_norm = g * weight
-
-    # dL/dx = dL/dx_norm * d(x_norm)/dx
-    # d(x_norm)/dx = 1 / sqrt(var + eps) - x_norm / (var + eps) * d(var)/dx - 1 / sqrt(var + eps) * d(mean)/dx
     N = x.shape[0]
     grad_x = (
-        grad_x_norm / np.sqrt(var + eps)
+        grad_x_norm / xp.sqrt(var + eps)
         - (grad_x_norm * x_norm) * (1 / (var + eps)) * (x - mean) / N
-        - np.mean(grad_x_norm, axis=0, keepdims=True) / np.sqrt(var + eps)
+        - xp.mean(grad_x_norm, axis=0, keepdims=True) / xp.sqrt(var + eps)
     )
-
     return grad_x

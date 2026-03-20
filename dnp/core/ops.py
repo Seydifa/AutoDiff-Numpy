@@ -48,9 +48,9 @@ class Ops:
     def __call__(self, *args, **kwargs):
         from .tensor import Tensor
         
-        # Extract raw data to avoid __array_finalize__ incorrectly copying parent IDs
-        args_data = [np.asarray(a) if isinstance(a, Tensor) else a for a in args]
-        kwargs_data = {k: (np.asarray(v) if isinstance(v, Tensor) else v) for k, v in kwargs.items()}
+        # Extract raw data
+        args_data = [a.data if isinstance(a, Tensor) else a for a in args]
+        kwargs_data = {k: (v.data if isinstance(v, Tensor) else v) for k, v in kwargs.items()}
         
         out_data = self.func(*args_data, **kwargs_data)
         

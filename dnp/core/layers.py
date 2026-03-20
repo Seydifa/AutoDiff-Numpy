@@ -20,10 +20,12 @@ Organization:
 
 # Third-party libraries
 import numpy as np
+from .backend import get_xp, as_numpy
 
 # Local imports: Core tensor and operations
 from .tensor import Tensor
 from . import ops
+from .vjp_rules import _conv2d_forward_kernel
 from .ops import (
     matmul,
     add,
@@ -74,6 +76,22 @@ class Module:
     def zero_grad(self):
         for p in self.parameters():
             p.grad = np.zeros_like(p)
+
+    def cpu(self):
+        """Move all parameters in this module to the CPU."""
+        for name, param in self._parameters.items():
+            param.cpu()
+        for name, module in self._modules.items():
+            module.cpu()
+        return self
+
+    def cuda(self):
+        """Move all parameters in this module to the GPU (CuPy)."""
+        for name, param in self._parameters.items():
+            param.cuda()
+        for name, module in self._modules.items():
+            module.cuda()
+        return self
 
     def eval(self):
         """Set module to evaluation mode (disables dropout, uses running stats for batchnorm)."""
@@ -214,9 +232,7 @@ class Conv2d(Module):
             self.b = None
 
     def forward(self, x: Tensor) -> Tensor:
-        """Forward pass: (batch, in_channels, H, W) -> (batch, out_channels, H', W')."""
-        from scipy.signal import convolve2d
-
+        """Forward pass using Numba-optimized kernel."""
         batch_size, in_channels, H, W = x.shape
         out_channels, _, kH, kW = self.W.shape
         stride_h, stride_w = self.stride
@@ -225,10 +241,8 @@ class Conv2d(Module):
         # Handle string padding modes
         if isinstance(pad, str):
             if pad.lower() == "same":
-                # For "same" mode with stride=1, compute padding to preserve spatial shape
-                # For stride > 1, output size is ceil(H / stride)
-                pad_h = max(0, (kH - 1) // 2)
-                pad_w = max(0, (kW - 1) // 2)
+                pad_h = (kH - 1) // 2
+                pad_w = (kW - 1) // 2
             elif pad.lower() == "valid":
                 pad_h, pad_w = 0, 0
             else:
@@ -239,36 +253,26 @@ class Conv2d(Module):
         # Apply padding
         if pad_h > 0 or pad_w > 0:
             x_padded = np.pad(
-                x, ((0, 0), (0, 0), (pad_h, pad_h), (pad_w, pad_w)), mode="constant"
+                as_numpy(x.data if hasattr(x, 'data') else x),
+                ((0, 0), (0, 0), (pad_h, pad_h), (pad_w, pad_w)),
+                mode="constant",
             )
         else:
-            x_padded = x
+            x_padded = as_numpy(x.data if hasattr(x, 'data') else x)
 
         # Compute output spatial dimensions
         H_out = (x_padded.shape[2] - kH) // stride_h + 1
         W_out = (x_padded.shape[3] - kW) // stride_w + 1
 
-        # Initialize output tensor
-        y = np.zeros((batch_size, out_channels, H_out, W_out), dtype=x.dtype)
+        # Use Numba kernel for the forward pass
+        y_data = _conv2d_forward_kernel(
+            x_padded, as_numpy(self.W.data), stride_h, stride_w, H_out, W_out
+        )
 
-        # Perform convolution for each sample in batch and each output channel
-        for b in range(batch_size):
-            for oc in range(out_channels):
-                # Convolution for this output channel across input channels
-                for ic in range(in_channels):
-                    # Slice the input for this batch and input channel
-                    x_ic = x_padded[b, ic, :, :]
-                    w_ic = self.W[oc, ic, :, :]
+        # Wrap result in Tensor and add bias
+        y = Tensor(y_data, parents=[x, self.W], op_func=None, name="Conv2d_forward")
 
-                    # Perform 2D convolution
-                    conv_result = convolve2d(x_ic, w_ic, mode="valid")
-
-                    # Apply stride and accumulate
-                    y[b, oc, :, :] += conv_result[::stride_h, ::stride_w]
-
-        # Apply bias if present
         if self.use_bias:
-            # Reshape bias to (1, out_channels, 1, 1) for broadcasting
             bias_reshaped = self.b.reshape(1, out_channels, 1, 1)
             y = add(y, bias_reshaped)
         return y
@@ -384,8 +388,8 @@ class BatchNorm1d(Module):
     def forward(self, x: Tensor) -> Tensor:
         """Forward pass using batch norm operation."""
         if self.training:
-            mean = np.mean(np.asarray(x), axis=0)
-            var = np.var(np.asarray(x), axis=0)
+            mean = np.mean(as_numpy(x.data if hasattr(x, 'data') else x), axis=0)
+            var = np.var(as_numpy(x.data if hasattr(x, 'data') else x), axis=0)
 
             self.running_mean = (
                 1 - self.momentum
@@ -419,7 +423,7 @@ class BatchNorm2d(Module):
 
     def forward(self, x: Tensor) -> Tensor:
         """Forward pass using batch norm operation."""
-        x_np = np.asarray(x)
+        x_np = as_numpy(x.data if hasattr(x, 'data') else x)
         if self.training:
             mean = np.mean(x_np, axis=(0, 2, 3))
             var = np.var(x_np, axis=(0, 2, 3))
@@ -439,7 +443,7 @@ class BatchNorm2d(Module):
         mean_reshaped = mean.reshape(shape_for_norm)
         var_reshaped = var.reshape(shape_for_norm)
         weight_reshaped = np.asarray(self.weight).reshape(shape_for_norm)
-        bias_reshaped = np.asarray(self.bias).reshape(shape_for_norm)
+        bias_reshaped = as_numpy(self.bias.data).reshape(shape_for_norm)
 
         # Use batch_norm operation
         return batch_norm(
@@ -486,7 +490,7 @@ class Embedding(Module):
         self.num_embeddings = num_embeddings
         
     def forward(self, x_idx):
-        x_idx_np = np.asarray(x_idx) if hasattr(x_idx, 'data') else x_idx
+        x_idx_np = (x_idx.data if hasattr(x_idx, 'data') else x_idx) if hasattr(x_idx, 'data') else x_idx
         one_hot = np.eye(self.num_embeddings)[x_idx_np]
         return self.lin(Tensor(one_hot))
 
@@ -536,7 +540,7 @@ class ScaledDotProductAttention(Module):
         """
         # Compute attention scores by transposing last 2 dims of key
         # Use ops.transpose to preserve the computational graph
-        ndim = len(np.asarray(key).shape)
+        ndim = len((key.data if hasattr(key, 'data') else key).shape)
         axes = list(range(ndim))
         axes[-1], axes[-2] = axes[-2], axes[-1]
         key_transposed = ops.transpose(key, axes=tuple(axes))
@@ -582,8 +586,8 @@ class MultiHeadAttention(Module):
         Returns:
             output: (batch, seq_len, d_model)
         """
-        batch_size = np.asarray(query).shape[0]
-        seq_len = np.asarray(query).shape[1]
+        batch_size = (query.data if hasattr(query, 'data') else query).shape[0]
+        seq_len = (query.data if hasattr(query, 'data') else query).shape[1]
 
         # Linear projections
         q = self.W_q(query)  # (batch, seq_len, d_model)
@@ -638,7 +642,7 @@ class SelfAttention(Module):
 class CrossEntropyLoss(Module):
     """Cross-entropy loss for multi-class classification."""
     def forward(self, logits: Tensor, targets) -> Tensor:
-        shape = np.asarray(logits).shape
+        shape = (logits.data if hasattr(logits, 'data') else logits).shape
         if len(shape) > 2:
             B, T, V = shape[0], shape[1], shape[2]
             logits_flat = ops.reshape(logits, newshape=(B * T, V))
@@ -646,7 +650,7 @@ class CrossEntropyLoss(Module):
             V = shape[1]
             logits_flat = logits
             
-        targets_flat = np.asarray(targets).flatten()
+        targets_flat = (targets.data if hasattr(targets, 'data') else targets).flatten()
             
         probs = ops.softmax(logits_flat)
         eps_tensor = Tensor(np.array([1e-8], dtype=np.float32))
@@ -674,7 +678,7 @@ class Flatten(Module):
         self.end_dim = end_dim
 
     def forward(self, x: Tensor) -> Tensor:
-        shape = np.asarray(x).shape
+        shape = as_numpy(x.data if hasattr(x, 'data') else x).shape
         ndim = len(shape)
         start = self.start_dim % ndim
         end = self.end_dim % ndim
@@ -689,7 +693,7 @@ class Flatten(Module):
         )  # -1 replaces flattened dims
 
         return Tensor(
-            np.asarray(x).reshape(new_shape),
+            as_numpy(x.data if hasattr(x, 'data') else x).reshape(new_shape),
             parents=[x],
             op_func=lambda: None,
             name="Flatten",
