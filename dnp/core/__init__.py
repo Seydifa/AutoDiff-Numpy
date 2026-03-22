@@ -76,6 +76,17 @@ from .ops import (
     zeros_like,
     full_like,
     random,
+    # array manipulation (v3)
+    concatenate,
+    stack,
+    clip,
+    cumsum,
+    flip,
+    roll,
+    tile,
+    repeat,
+    where,
+    gather,
 )
 
 # Local imports: Neural network layers (centralized in core/layers.py)
@@ -96,10 +107,21 @@ from .layers import (
     Sigmoid,
     Tanh,
     Softmax,
+    LeakyReLU,
+    ELU,
+    Softplus,
+    Swish,
+    GELU,
     ScaledDotProductAttention,
     MultiHeadAttention,
     SelfAttention,
+    PositionalEncoding,
+    FeedForward,
+    TransformerEncoderLayer,
     CrossEntropyLoss,
+    MSELoss,
+    BCELoss,
+    BCEWithLogitsLoss,
 )
 
 # Local imports: Optimization algorithms
@@ -196,6 +218,17 @@ __all__ = [
     "zeros_like",
     "full_like",
     "random",
+    # Array manipulation (v3)
+    "concatenate",
+    "stack",
+    "clip",
+    "cumsum",
+    "flip",
+    "roll",
+    "tile",
+    "repeat",
+    "where",
+    "gather",
     # Neural-network layers
     "Module",
     "Sequential",
@@ -211,6 +244,11 @@ __all__ = [
     "Sigmoid",
     "Tanh",
     "Softmax",
+    "LeakyReLU",
+    "ELU",
+    "Softplus",
+    "Swish",
+    "GELU",
     # Normalization layers
     "BatchNorm1d",
     "BatchNorm2d",
@@ -221,10 +259,17 @@ __all__ = [
     "Dropout",
     # Loss layers
     "CrossEntropyLoss",
+    "MSELoss",
+    "BCELoss",
+    "BCEWithLogitsLoss",
     # Attention layers
     "ScaledDotProductAttention",
     "MultiHeadAttention",
     "SelfAttention",
+    # Transformer building blocks
+    "PositionalEncoding",
+    "FeedForward",
+    "TransformerEncoderLayer",
     # Utility layers
     "Flatten",
     # Optimization algorithms

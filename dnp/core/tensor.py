@@ -188,10 +188,11 @@ class Tensor:
                 if hasattr(op, "vpj"):
                     all_grads = op.vpj(node.grad, **node.op_kwargs)
                 else:
-                    import numpy as _np_bwd
+                    from .backend import get_xp as _get_xp_bwd
 
+                    _xp_bwd = _get_xp_bwd(node.grad)
                     vjp_args = [
-                        _np_bwd.asarray(a) if isinstance(a, (int, float)) else a
+                        _xp_bwd.asarray(a) if isinstance(a, (int, float)) else a
                         for a in node.op_kwargs["_vjp_args"]
                     ]
                     other_kwargs = {

@@ -20,7 +20,7 @@ Organization:
 
 # Third-party libraries
 import numpy as np
-from .backend import get_xp, as_numpy, get_dtype
+from .backend import get_xp, as_numpy, get_dtype, safe_eps
 
 # Local imports: Core tensor and operations
 from .tensor import Tensor
@@ -30,6 +30,11 @@ from .ops import (
     matmul,
     add,
     relu,
+    leaky_relu,
+    elu,
+    softplus,
+    swish,
+    gelu,
     sigmoid,
     tanh,
     softmax,
@@ -55,10 +60,10 @@ def _apply_initializer(name: str, shape, dtype) -> np.ndarray:
         return np.random.uniform(-limit, limit, shape).astype(dtype)
     if name == "glorot_normal":
         std = np.sqrt(2.0 / (fan_in + fan_out))
-        return np.random.randn(*shape).astype(dtype) * std
+        return (np.random.randn(*shape) * std).astype(dtype)
     if name == "he_normal":
         std = np.sqrt(2.0 / fan_in)
-        return np.random.randn(*shape).astype(dtype) * std
+        return (np.random.randn(*shape) * std).astype(dtype)
     if name == "ones":
         return np.ones(shape, dtype=dtype)
     if name == "zeros":
@@ -501,6 +506,45 @@ class Softmax(_ActivationModule):
         super().__init__(softmax, "Softmax")
 
 
+class LeakyReLU(_ActivationModule):
+    """Leaky ReLU activation: max(alpha*x, x)."""
+
+    def __init__(self, alpha: float = 0.01):
+        super().__init__(
+            lambda x: leaky_relu(x, alpha=alpha), f"LeakyReLU(alpha={alpha})"
+        )
+        self.alpha = alpha
+
+
+class ELU(_ActivationModule):
+    """Exponential Linear Unit activation."""
+
+    def __init__(self, alpha: float = 1.0):
+        super().__init__(lambda x: elu(x, alpha=alpha), f"ELU(alpha={alpha})")
+        self.alpha = alpha
+
+
+class Softplus(_ActivationModule):
+    """Softplus activation: log(1 + exp(x))."""
+
+    def __init__(self):
+        super().__init__(softplus, "Softplus")
+
+
+class Swish(_ActivationModule):
+    """Swish / SiLU activation: x * sigmoid(x)."""
+
+    def __init__(self):
+        super().__init__(swish, "Swish")
+
+
+class GELU(_ActivationModule):
+    """Gaussian Error Linear Unit activation."""
+
+    def __init__(self):
+        super().__init__(gelu, "GELU")
+
+
 # ============================================================================
 # NORMALIZATION LAYERS
 # ============================================================================
@@ -532,13 +576,16 @@ class BatchNorm1d(Module):
         if self.training:
             mean = xp.mean(x.data, axis=0)
             var = xp.var(x.data, axis=0)
-            # Running stats are always kept as plain numpy (not differentiable).
+            # Keep running stats on the same device as x; migrate once on device switch.
+            if get_xp(self.running_mean) is not xp:
+                self.running_mean = xp.asarray(self.running_mean)
+                self.running_var = xp.asarray(self.running_var)
             self.running_mean = (
                 1 - self.momentum
-            ) * self.running_mean + self.momentum * as_numpy(mean)
+            ) * self.running_mean + self.momentum * mean
             self.running_var = (
                 1 - self.momentum
-            ) * self.running_var + self.momentum * as_numpy(var)
+            ) * self.running_var + self.momentum * var
         else:
             mean = xp.asarray(self.running_mean)
             var = xp.asarray(self.running_var)
@@ -574,12 +621,16 @@ class BatchNorm2d(Module):
         if self.training:
             mean = xp.mean(x.data, axis=(0, 2, 3))
             var = xp.var(x.data, axis=(0, 2, 3))
+            # Keep running stats on the same device as x; migrate once on device switch.
+            if get_xp(self.running_mean) is not xp:
+                self.running_mean = xp.asarray(self.running_mean)
+                self.running_var = xp.asarray(self.running_var)
             self.running_mean = (
                 1 - self.momentum
-            ) * self.running_mean + self.momentum * as_numpy(mean)
+            ) * self.running_mean + self.momentum * mean
             self.running_var = (
                 1 - self.momentum
-            ) * self.running_var + self.momentum * as_numpy(var)
+            ) * self.running_var + self.momentum * var
         else:
             mean = xp.asarray(self.running_mean)
             var = xp.asarray(self.running_var)
@@ -648,9 +699,9 @@ class Embedding(Module):
 
     def forward(self, x_idx):
         """x_idx : integer array / Tensor of shape (seq_len,) or (batch, seq_len)."""
-        x_np = as_numpy(x_idx.data if isinstance(x_idx, Tensor) else x_idx).astype(int)
-        # ops.gather: O(seq_len × embed_dim) — no one-hot matrix, no full matmul.
-        return gather(self.W, x_np)
+        x_data = x_idx.data if isinstance(x_idx, Tensor) else x_idx
+        # astype(int) on the native device — cupy accepts xp int arrays for fancy indexing.
+        return gather(self.W, x_data.astype(int))
 
 
 # ============================================================================
@@ -805,18 +856,16 @@ class CrossEntropyLoss(Module):
             V = shape[1]
             logits_flat = logits
 
-        targets_np = (
-            as_numpy(targets.data if isinstance(targets, Tensor) else targets)
-            .flatten()
-            .astype(int)
-        )
+        _t = targets.data if isinstance(targets, Tensor) else targets
+        xp = get_xp(logits_flat.data)
+        # Stay on device — xp.asarray is a no-op when already on the correct device.
+        targets_i = xp.asarray(_t).flatten().astype(int)
 
         probs = ops.softmax(logits_flat)
         # Use Python float — avoids adding a spurious leaf Tensor node each forward call.
-        log_probs = ops.log(probs + 1e-8)
+        log_probs = ops.log(probs + safe_eps(probs.data))
 
-        xp = get_xp(logits_flat.data)
-        one_hot = xp.eye(V, dtype=get_dtype())[xp.asarray(targets_np)]
+        one_hot = xp.eye(V, dtype=get_dtype())[targets_i]
         t_one_hot = Tensor(one_hot)
 
         selected = log_probs * t_one_hot
@@ -887,7 +936,7 @@ class BCELoss(Module):
         if not isinstance(y_true, Tensor):
             y_true = Tensor(y_true)
         # Clamp via log — add small epsilon to avoid log(0)
-        eps = 1e-8
+        eps = safe_eps(y_pred.data)
         pos = y_true * ops.log(y_pred + eps)
         neg = (1.0 - y_true) * ops.log(1.0 - y_pred + eps)
         loss = -(pos + neg)
@@ -969,6 +1018,151 @@ class Flatten(Module):
 
 
 # ============================================================================
+# TRANSFORMER BUILDING BLOCKS
+# ============================================================================
+
+
+class PositionalEncoding(Module):
+    """Sinusoidal positional encoding (non-trainable).
+
+    From "Attention Is All You Need" (Vaswani et al., 2017).  Adds a fixed
+    sinusoidal pattern to token embeddings so the model can exploit position.
+
+    Parameters
+    ----------
+    d_model : int
+        Embedding dimension.
+    max_len : int
+        Maximum sequence length the table is pre-computed for.
+    dropout_p : float
+        Dropout probability applied after adding positional encoding.
+    """
+
+    def __init__(self, d_model: int, max_len: int = 5000, dropout_p: float = 0.1):
+        super().__init__()
+        self.dropout_p = dropout_p
+
+        # Build (max_len, d_model) sinusoidal table once at init (CPU).
+        position = np.arange(max_len)[:, None]  # (max_len, 1)
+        div_term = np.exp(np.arange(0, d_model, 2) * (-np.log(10000.0) / d_model))
+        pe = np.zeros((max_len, d_model), dtype=get_dtype())
+        pe[:, 0::2] = np.sin(position * div_term)
+        pe[:, 1::2] = np.cos(position * div_term)
+        # Store as a buffer: shape (1, max_len, d_model) for easy broadcasting.
+        self._buffers["pe"] = pe[None, :, :]
+
+    def forward(self, x: Tensor) -> Tensor:
+        """x: (batch, seq_len, d_model)"""
+        xp = get_xp(x.data)
+        seq_len = x.shape[1]
+        pe = self._buffers["pe"]
+        # Lazy device migration — migrate once, then stays on device.
+        if get_xp(pe) is not xp:
+            pe = xp.asarray(pe)
+            self._buffers["pe"] = pe
+        pe_slice = Tensor(pe[:, :seq_len, :])
+        x = x + pe_slice
+        if self.training and self.dropout_p > 0.0:
+            x = dropout(x, p=self.dropout_p, training=True)
+        return x
+
+
+class FeedForward(Module):
+    """Position-wise Feed-Forward block used in transformer layers.
+
+    Architecture: Linear → activation → Dropout → Linear
+
+    Parameters
+    ----------
+    d_model : int
+        Input / output dimension.
+    d_ff : int
+        Hidden dimension (typically 4 * d_model).
+    activation : str
+        One of ``'relu'``, ``'gelu'``, ``'swish'``.
+    dropout_p : float
+        Dropout probability between the two linear projections.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int,
+        activation: str = "relu",
+        dropout_p: float = 0.1,
+    ):
+        super().__init__()
+        self.fc1 = Linear(d_model, d_ff)
+        self.fc2 = Linear(d_ff, d_model)
+        self.dropout_p = dropout_p
+
+        _act_map = {"relu": relu, "gelu": gelu, "swish": swish}
+        if activation not in _act_map:
+            raise ValueError(
+                f"Unsupported activation '{activation}'. Choose from {list(_act_map)}."
+            )
+        self._act_fn = _act_map[activation]
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.fc1(x)
+        x = self._act_fn(x)
+        if self.training and self.dropout_p > 0.0:
+            x = dropout(x, p=self.dropout_p, training=True)
+        return self.fc2(x)
+
+
+class TransformerEncoderLayer(Module):
+    """Single transformer encoder layer.
+
+    Implements the standard pre-norm or post-norm (default) block::
+
+        x = LayerNorm(x + Dropout(MHA(x, x, x, mask)))
+        x = LayerNorm(x + FFN(x))
+
+    Parameters
+    ----------
+    d_model : int
+        Model / embedding dimension.
+    num_heads : int
+        Number of attention heads.
+    d_ff : int
+        Feed-forward hidden dimension.
+    dropout_p : float
+        Dropout probability for attention output and FFN.
+    activation : str
+        FFN activation — ``'relu'``, ``'gelu'``, or ``'swish'``.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        dropout_p: float = 0.1,
+        activation: str = "relu",
+    ):
+        super().__init__()
+        self.attn = MultiHeadAttention(d_model, num_heads)
+        self.norm1 = LayerNorm(d_model)
+        self.ffn = FeedForward(
+            d_model, d_ff, activation=activation, dropout_p=dropout_p
+        )
+        self.norm2 = LayerNorm(d_model)
+        self.dropout_p = dropout_p
+
+    def forward(self, x: Tensor, mask=None) -> Tensor:
+        # --- Self-attention sublayer ---
+        attn_out = self.attn(x, x, x, mask)
+        if self.training and self.dropout_p > 0.0:
+            attn_out = dropout(attn_out, p=self.dropout_p, training=True)
+        x = self.norm1(x + attn_out)
+        # --- Feed-forward sublayer ---
+        ffn_out = self.ffn(x)
+        x = self.norm2(x + ffn_out)
+        return x
+
+
+# ============================================================================
 # EXPORTS
 # ============================================================================
 
@@ -988,6 +1182,11 @@ __all__ = [
     "Sigmoid",
     "Tanh",
     "Softmax",
+    "LeakyReLU",
+    "ELU",
+    "Softplus",
+    "Swish",
+    "GELU",
     # Normalization layers
     "BatchNorm1d",
     "BatchNorm2d",
@@ -999,6 +1198,11 @@ __all__ = [
     "ScaledDotProductAttention",
     "MultiHeadAttention",
     "SelfAttention",
+    # Transformer building blocks
+    "PositionalEncoding",
+    "FeedForward",
+    "TransformerEncoderLayer",
+    # Loss functions
     "CrossEntropyLoss",
     "MSELoss",
     "BCELoss",

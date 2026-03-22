@@ -1,20 +1,24 @@
 """
 dnp/core/ops.py
 ===============
-`Ops` class and all pre-built operation instances.
+``Ops`` class and all pre-built operation instances.
 
-Each `Ops` object bundles:
-  - a forward callable  (`op.func`)
-  - a human-readable name
+Each ``Ops`` object bundles:
+  - a forward callable (``op.func``) — the NumPy ufunc / function used as the
+    ``VJP_RULES`` registry key, guaranteeing unique identity across backends.
+  - explicit backend dispatch at call time (CuPy when arrays live on GPU)
+  - a ``graph_fn`` wrapper that auto-promotes raw arrays / scalars to ``Tensor``
 
-v3 changes
-----------
-* Every ``Ops.__call__`` is now wrapped by :func:`graph_fn`, so raw numpy/cupy
-  arrays and plain Python scalars are auto-promoted to ``Tensor`` before the
-  forward function runs.  ``array_creation`` helpers (arange, ones, zeros, …)
-  are also exposed here as graph-compatible callables.
-* ``vpj_fun`` attribute removed — it was stored but never used; VJPs are
-  looked up directly via ``VJP_RULES[node.op_func]`` in ``Tensor.backward()``.
+Sections
+--------
+1. ``Ops`` base class + specialised subclasses
+   (``_DropoutOps``, ``_GatherOps``, ``_WhereOps``)
+2. Pre-built op instances grouped by category
+   binary · unary · trig · rounding · reductions · shape ·
+   array-manipulation · nn activations · conv · pooling · norm
+3. Array creation helpers (``arange``, ``ones``, ``zeros``, …)
+4. ``_RandomModule``  (``ops.random.randn``, …)
+5. ``__all__``
 """
 
 # Third-party libraries
@@ -24,8 +28,7 @@ import numpy as np
 from .session import graph_fn
 from .vjp_rules import (
     VJP_RULES,
-    EPSILON,
-    unbroadcast,
+    # forward callables used as func= for Ops instances below
     sigmoid,
     relu,
     leaky_relu,
@@ -35,13 +38,13 @@ from .vjp_rules import (
     gelu,
     softmax,
     conv2d,
-    rot180,
-    conv2d_full,
     max_pool2d,
     avg_pool2d,
     dropout,
     batch_norm,
     _reshape,
+    _concatenate,
+    _stack,
 )
 
 
@@ -65,6 +68,7 @@ class Ops:
     def _raw_call(self, *args, **kwargs):
         """Inner call that expects Tensor arguments (graph_fn handles promotion)."""
         from .tensor import Tensor
+        from .backend import get_xp
 
         # Extract raw data
         args_data = [a.data if isinstance(a, Tensor) else a for a in args]
@@ -72,7 +76,25 @@ class Ops:
             k: (v.data if isinstance(v, Tensor) else v) for k, v in kwargs.items()
         }
 
-        out_data = self.func(*args_data, **kwargs_data)
+        # Explicitly dispatch to the correct backend module.
+        # self.func stays as np.* so VJP_RULES lookup keys are never invalidated.
+        # Fallback to self.func (protocol dispatch) when no named match is found.
+        first_arr = next(
+            (a for a in args_data if hasattr(a, "shape")),
+            next((v for v in kwargs_data.values() if hasattr(v, "shape")), None),
+        )
+        if first_arr is not None:
+            xp = get_xp(first_arr)
+            if xp is not np:
+                func_name = getattr(self.func, "__name__", None)
+                xp_func = getattr(xp, func_name, None) if func_name else None
+                _call = xp_func if xp_func is not None else self.func
+            else:
+                _call = self.func
+        else:
+            _call = self.func
+
+        out_data = _call(*args_data, **kwargs_data)
 
         # Collect Tensor parents (positional only; kwargs Tensors are rare and
         # handled separately via op_kwargs).
@@ -112,13 +134,15 @@ class Ops:
         ``_raw_call`` inserts when positional args are a mix of scalars
         and Tensors (e.g. ``1.0 - tensor``).
         """
-        import numpy as _np
+        from .backend import get_xp as _get_xp
 
         if "_vjp_args" in op_kwargs:
             # Reconstruct the full positional arg list; wrap plain scalars as
-            # 0-d arrays so VJP lambdas that call `.shape` on all args work.
+            # 0-d arrays on the same device as grad so VJP lambdas that call
+            # .shape on all args work and get_xp() returns the right backend.
+            _xp = _get_xp(grad)
             full_args = [
-                _np.asarray(a) if isinstance(a, (int, float)) else a
+                _xp.asarray(a) if isinstance(a, (int, float)) else a
                 for a in op_kwargs["_vjp_args"]
             ]
             clean_kwargs = {
@@ -213,7 +237,7 @@ class _GatherOps(Ops):
 
     def _raw_call(self, *args, **kwargs):
         from .tensor import Tensor
-        from .backend import get_xp, as_numpy
+        from .backend import as_numpy
 
         W = args[0]
         # indices may be a raw int array OR a Tensor (graph_fn converts numpy
@@ -307,6 +331,89 @@ expand_dims = Ops(np.expand_dims, name="expand_dims")
 squeeze = Ops(np.squeeze, name="squeeze")
 
 # ---------------------------------------------------------------------------
+# Array manipulation operations
+# ---------------------------------------------------------------------------
+concatenate = Ops(_concatenate, name="concatenate")
+stack = Ops(_stack, name="stack")
+clip = Ops(np.clip, name="clip")
+cumsum = Ops(np.cumsum, name="cumsum")
+flip = Ops(np.flip, name="flip")
+roll = Ops(np.roll, name="roll")
+tile = Ops(np.tile, name="tile")
+repeat = Ops(np.repeat, name="repeat")
+
+
+# ---------------------------------------------------------------------------
+# where — condition is not differentiable; handled by a custom Ops subclass
+# ---------------------------------------------------------------------------
+
+
+class _WhereOps(Ops):
+    """where(condition, x, y) — condition is excluded from gradient tracking.
+
+    ``graph_fn`` would normally convert a boolean ndarray condition into a
+    Tensor (with float dtype), breaking the mask.  This subclass bypasses
+    that conversion and only adds *x* and *y* as differentiable parents.
+    """
+
+    def __call__(self, condition, x, y):
+        """Wrap only x and y; keep condition as a raw array."""
+        from .tensor import Tensor
+
+        # Strip Tensor wrappers from condition so it stays as a bool array.
+        if isinstance(condition, Tensor):
+            condition = condition.data
+
+        # Promote x / y from ndarray → Tensor if needed.
+        if hasattr(x, "shape") and not isinstance(x, Tensor):
+            x = Tensor(x)
+        if hasattr(y, "shape") and not isinstance(y, Tensor):
+            y = Tensor(y)
+
+        return self._raw_call(condition, x, y)
+
+    def _raw_call(self, condition, x, y):
+        from .tensor import Tensor
+        from .backend import get_xp
+
+        x_data = x.data if isinstance(x, Tensor) else x
+        y_data = y.data if isinstance(y, Tensor) else y
+        xp = get_xp(x_data) if hasattr(x_data, "shape") else np
+        out_data = xp.where(condition, x_data, y_data)
+
+        parents = [p for p in (x, y) if isinstance(p, Tensor)]
+        if not parents:
+            return out_data
+
+        return Tensor(
+            out_data,
+            parents=parents,
+            op_func=self,
+            op_kwargs={
+                "condition": condition,
+                "x_is_tensor": isinstance(x, Tensor),
+                "y_is_tensor": isinstance(y, Tensor),
+            },
+            name=self.name,
+        )
+
+    def vpj(self, grad, *args, **op_kwargs):
+        from .backend import get_xp
+
+        xp = get_xp(grad)
+        condition = op_kwargs["condition"]
+        zeros = xp.zeros_like(grad)
+        grads = []
+        if op_kwargs.get("x_is_tensor", True):
+            grads.append(xp.where(condition, grad, zeros))
+        if op_kwargs.get("y_is_tensor", True):
+            grads.append(xp.where(condition, zeros, grad))
+        return tuple(grads)
+
+
+where = _WhereOps(np.where, name="where")
+
+# ---------------------------------------------------------------------------
 # Neural-network & custom ops
 # ---------------------------------------------------------------------------
 conv2d = Ops(conv2d, name="conv2d")
@@ -339,19 +446,20 @@ gather = _GatherOps(_gather_forward, name="gather")
 
 
 def _tensor_creation(np_func, name):
-    """Factory: wrap a numpy array-creation function to return a leaf Tensor."""
-    from .tensor import Tensor
+    """Factory: wrap a numpy array-creation function to return a leaf Tensor.
 
-    @graph_fn.__wrapped__ if hasattr(graph_fn, "__wrapped__") else (lambda f: f)
-    def _creator(*args, **kwargs):
-        data = np_func(*args, **kwargs)
-        return Tensor(data, name=name)
+    Uses the active backend (CuPy when available) so creation ops stay on the
+    same device as the rest of the computation graph.
+    """
+    from .backend import backend as _backend
 
-    # Build a plain wrapper (no graph_fn autocast needed — these create leaves)
+    _func_name = np_func.__name__
+
     def creator(*args, **kwargs):
         from .tensor import Tensor
 
-        data = np_func(*args, **kwargs)
+        xp_func = getattr(_backend, _func_name, np_func)
+        data = xp_func(*args, **kwargs)
         return Tensor(data, name=name)
 
     creator.__name__ = name
@@ -403,40 +511,49 @@ def full_like(x, fill_value):
 
 
 class _RandomModule:
-    """Namespace for random array creation that returns Tensors."""
+    """Namespace for random array creation that returns Tensors.
+
+    All methods use the active backend so random arrays land on the same
+    device as the rest of the computation graph.
+    """
 
     @staticmethod
     def randn(*shape):
         from .tensor import Tensor
+        from .backend import backend as _backend
 
-        return Tensor(np.random.randn(*shape), name="randn")
+        return Tensor(_backend.random.randn(*shape), name="randn")
 
     @staticmethod
     def rand(*shape):
         from .tensor import Tensor
+        from .backend import backend as _backend
 
-        return Tensor(np.random.rand(*shape), name="rand")
+        return Tensor(_backend.random.rand(*shape), name="rand")
 
     @staticmethod
     def randint(low, high=None, size=None):
         from .tensor import Tensor
+        from .backend import backend as _backend, get_dtype
 
         return Tensor(
-            np.random.randint(low, high=high, size=size).astype(np.float64),
+            _backend.random.randint(low, high=high, size=size).astype(get_dtype()),
             name="randint",
         )
 
     @staticmethod
     def uniform(low=0.0, high=1.0, size=None):
         from .tensor import Tensor
+        from .backend import backend as _backend
 
-        return Tensor(np.random.uniform(low, high, size), name="uniform")
+        return Tensor(_backend.random.uniform(low, high, size), name="uniform")
 
     @staticmethod
     def normal(loc=0.0, scale=1.0, size=None):
         from .tensor import Tensor
+        from .backend import backend as _backend
 
-        return Tensor(np.random.normal(loc, scale, size), name="normal")
+        return Tensor(_backend.random.normal(loc, scale, size), name="normal")
 
     @staticmethod
     def seed(s):
@@ -519,4 +636,15 @@ __all__ = [
     "full_like",
     # random
     "random",
+    # array manipulation
+    "concatenate",
+    "stack",
+    "clip",
+    "cumsum",
+    "flip",
+    "roll",
+    "tile",
+    "repeat",
+    "where",
+    "gather",
 ]

@@ -11,6 +11,11 @@ from dnp.core.layers import (
     Sigmoid,
     Tanh,
     Softmax,
+    LeakyReLU,
+    ELU,
+    Softplus,
+    Swish,
+    GELU,
     BatchNorm1d,
     BatchNorm2d,
     LayerNorm,
@@ -19,6 +24,9 @@ from dnp.core.layers import (
     ScaledDotProductAttention,
     MultiHeadAttention,
     SelfAttention,
+    PositionalEncoding,
+    FeedForward,
+    TransformerEncoderLayer,
     Flatten,
     CrossEntropyLoss,
     MSELoss,
@@ -42,6 +50,11 @@ __all__ = [
     "Sigmoid",
     "Tanh",
     "Softmax",
+    "LeakyReLU",
+    "ELU",
+    "Softplus",
+    "Swish",
+    "GELU",
     # Normalization layers
     "BatchNorm1d",
     "BatchNorm2d",
@@ -50,15 +63,19 @@ __all__ = [
     "Embedding",
     # Regularization layers
     "Dropout",
+    # Attention layers
+    "ScaledDotProductAttention",
+    "MultiHeadAttention",
+    "SelfAttention",
+    # Transformer building blocks
+    "PositionalEncoding",
+    "FeedForward",
+    "TransformerEncoderLayer",
     # Loss layers
     "CrossEntropyLoss",
     "MSELoss",
     "BCELoss",
     "BCEWithLogitsLoss",
-    # Attention layers
-    "ScaledDotProductAttention",
-    "MultiHeadAttention",
-    "SelfAttention",
     # Utility layers
     "Flatten",
 ]

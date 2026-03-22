@@ -26,7 +26,7 @@ import math
 from typing import List, Dict, Any, Optional
 
 # Local imports
-from .backend import get_xp
+from .backend import get_xp, safe_eps
 from .session import session
 
 
@@ -301,7 +301,7 @@ class Adam(Optimizer):
                 # learning rates, reducing the effective learning rate for parameters
                 # with large gradient variance and increasing it for those with small variance
                 xp = get_xp(v_hat)
-                p[...] = p.data - self.lr * m_hat / (xp.sqrt(v_hat) + self.epsilon)
+                p[...] = p.data - self.lr * m_hat / (xp.sqrt(v_hat) + safe_eps(grad))
 
 
 class Momentum(Optimizer):
@@ -511,10 +511,10 @@ class RMSprop(Optimizer):
                         self.alpha * self.buffer[pid] + (1.0 - self.alpha) * grad
                     )
                     denominator = (
-                        self.sq_avg[pid] - self.buffer[pid] ** 2 + self.epsilon
+                        self.sq_avg[pid] - self.buffer[pid] ** 2 + safe_eps(grad)
                     )
                 else:
-                    denominator = self.sq_avg[pid] + self.epsilon
+                    denominator = self.sq_avg[pid] + safe_eps(grad)
 
                 # Update parameter: p = p - lr * grad / sqrt(denominator)
                 xp = get_xp(denominator)
@@ -610,7 +610,7 @@ class Adagrad(Optimizer):
                 # Update parameter: p = p - lr * grad / sqrt(G + epsilon)
                 xp = get_xp(self.sq_sum[pid])
                 p[...] = p.data - self.lr * grad / (
-                    xp.sqrt(self.sq_sum[pid]) + self.epsilon
+                    xp.sqrt(self.sq_sum[pid]) + safe_eps(grad)
                 )
 
 
@@ -741,7 +741,7 @@ class AdamW(Optimizer):
                 # The key difference from Adam: weight decay is applied directly,
                 # not scaled by the adaptive learning rate
                 xp = get_xp(v_hat)
-                adaptive_update = self.lr * m_hat / (xp.sqrt(v_hat) + self.epsilon)
+                adaptive_update = self.lr * m_hat / (xp.sqrt(v_hat) + safe_eps(grad))
                 weight_decay_update = self.weight_decay * self.lr * p.data
                 p[...] = p.data - adaptive_update - weight_decay_update
 

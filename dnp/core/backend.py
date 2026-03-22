@@ -68,8 +68,8 @@ def is_cupy_array(data):
 
 def get_xp(data):
     """Return the correct module (numpy or cupy) based on the array type."""
-    if is_cuda_available:
-        return cp.get_array_module(data)
+    if is_cuda_available and type(data).__module__ == "cupy":
+        return cp
     return np
 
 
@@ -97,6 +97,37 @@ def to_device(data, device: str):
     if device == "cuda":
         return as_cupy(data)
     return as_numpy(data)
+
+
+def safe_eps(data) -> float:
+    """Return a dtype-safe numerical stability epsilon for *data*.
+
+    The hard-coded constant ``1e-8`` used as a division guard underflows to
+    **zero** in float16 (the smallest subnormal is ~5.96e-8), making guards
+    like ``x + 1e-8`` no-ops and causing division-by-zero during float16
+    training.  This function instead returns ``finfo(dtype).tiny`` — the
+    smallest *representable* positive normal for the dtype — which is always
+    non-zero:
+
+    * float16 → 6.10e-05
+    * float32 → 1.18e-38
+    * float64 → 2.23e-308
+
+    Parameters
+    ----------
+    data : array-like with a ``.dtype`` attribute
+        Any numpy / cupy array or Tensor whose dtype should be used.
+
+    Returns
+    -------
+    float
+        A Python float safe to add to arrays of *data*'s dtype without
+        underflowing to zero.
+    """
+    dtype = getattr(data, "dtype", np.float64)
+    if np.issubdtype(dtype, np.floating):
+        return float(np.finfo(dtype).tiny)
+    return 1e-8
 
 
 def synchronize():
