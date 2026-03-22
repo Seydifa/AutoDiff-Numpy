@@ -735,7 +735,7 @@ class ScaledDotProductAttention(Module):
     def __init__(self, d_k: int):
         super().__init__()
         self.d_k = d_k
-        self.scale = 1.0 / np.sqrt(d_k)
+        self.scale = float(1.0 / np.sqrt(d_k))
 
     def forward(self, query: Tensor, key: Tensor, value: Tensor, mask=None) -> Tensor:
         """
