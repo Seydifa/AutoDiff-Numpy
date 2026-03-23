@@ -68,7 +68,7 @@ def is_cupy_array(data):
 
 def get_xp(data):
     """Return the correct module (numpy or cupy) based on the array type."""
-    if is_cuda_available and type(data).__module__ == "cupy":
+    if is_cuda_available and isinstance(data, cp.ndarray):
         return cp
     return np
 
