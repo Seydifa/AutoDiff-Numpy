@@ -869,8 +869,12 @@ def _vjp_conv2d_forward_kernel(
                 dw : dw + W_out * stride_w : stride_w,
             ] += dcols[:, :, dh, dw, :, :]
 
-    if pad_h > 0 or pad_w > 0:
+    if pad_h > 0 and pad_w > 0:
         dx = dx_padded[:, :, pad_h:-pad_h, pad_w:-pad_w]
+    elif pad_h > 0:
+        dx = dx_padded[:, :, pad_h:-pad_h, :]
+    elif pad_w > 0:
+        dx = dx_padded[:, :, :, pad_w:-pad_w]
     else:
         dx = dx_padded
 
