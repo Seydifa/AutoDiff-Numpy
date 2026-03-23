@@ -202,8 +202,9 @@ class Tensor:
                     }
                     all_grads = VJP_RULES[op](node.grad, *vjp_args, **other_kwargs)
                 for parent, orig_idx in zip(node.parents, parent_indices):
-                    if isinstance(parent, Tensor):
-                        parent.grad += all_grads[orig_idx]
+                    g = all_grads[orig_idx]
+                    if isinstance(parent, Tensor) and g is not None:
+                        parent.grad += g
             else:
                 args_data = [
                     p.data if isinstance(p, Tensor) else p for p in node.parents
@@ -213,7 +214,7 @@ class Tensor:
                 else:
                     gradients = VJP_RULES[op](node.grad, *args_data, **node.op_kwargs)
                 for parent, g in zip(node.parents, gradients):
-                    if isinstance(parent, Tensor):
+                    if isinstance(parent, Tensor) and g is not None:
                         parent.grad += g
 
     def __repr__(self):

@@ -855,24 +855,13 @@ class CrossEntropyLoss(Module):
             B, T, V = shape[0], shape[1], shape[2]
             logits_flat = ops.reshape(logits, newshape=(B * T, V))
         else:
-            V = shape[1]
             logits_flat = logits
 
         _t = targets.data if isinstance(targets, Tensor) else targets
         xp = get_xp(logits_flat.data)
-        # Stay on device — xp.asarray is a no-op when already on the correct device.
-        targets_i = xp.asarray(_t).flatten().astype(int)
+        targets_i = xp.asarray(_t).flatten().astype(xp.int64)
 
-        probs = ops.softmax(logits_flat)
-        # Use Python float — avoids adding a spurious leaf Tensor node each forward call.
-        log_probs = ops.log(probs + safe_eps(probs.data))
-
-        one_hot = xp.eye(V, dtype=get_dtype())[targets_i]
-        t_one_hot = Tensor(one_hot)
-
-        selected = log_probs * t_one_hot
-        summed = ops.sum(selected, axis=-1)
-        return -ops.mean(summed)
+        return ops.sparse_cce_with_logits_loss(logits_flat, Tensor(targets_i))
 
 
 # ============================================================================
@@ -903,10 +892,10 @@ class MSELoss(Module):
     def forward(self, y_pred: Tensor, y_true) -> Tensor:
         if not isinstance(y_true, Tensor):
             y_true = Tensor(y_true)
+        if self.reduction == "mean":
+            return ops.mse_loss(y_pred, y_true)
         diff = y_pred - y_true
         sq = ops.square(diff)
-        if self.reduction == "mean":
-            return ops.mean(sq)
         if self.reduction == "sum":
             return ops.sum(sq)
         return sq  # 'none'
@@ -937,13 +926,13 @@ class BCELoss(Module):
     def forward(self, y_pred: Tensor, y_true) -> Tensor:
         if not isinstance(y_true, Tensor):
             y_true = Tensor(y_true)
-        # Clamp via log — add small epsilon to avoid log(0)
+        if self.reduction == "mean":
+            return ops.bce_loss(y_pred, y_true)
+        # fall back to composed ops for sum / none
         eps = safe_eps(y_pred.data)
         pos = y_true * ops.log(y_pred + eps)
         neg = (1.0 - y_true) * ops.log(1.0 - y_pred + eps)
         loss = -(pos + neg)
-        if self.reduction == "mean":
-            return ops.mean(loss)
         if self.reduction == "sum":
             return ops.sum(loss)
         return loss  # 'none'
@@ -984,12 +973,12 @@ class BCEWithLogitsLoss(Module):
     def forward(self, logits: Tensor, y_true) -> Tensor:
         if not isinstance(y_true, Tensor):
             y_true = Tensor(y_true)
-        # Numerically stable: max(x,0) - x*y + log(1 + exp(-|x|))
+        if self.reduction == "mean":
+            return ops.bce_with_logits_loss(logits, y_true)
+        # fall back to composed ops for sum / none
         relu_x = ops.relu(logits)
         abs_x = ops.absolute(logits)
         loss = relu_x - logits * y_true + ops.log1p(ops.exp(-abs_x))
-        if self.reduction == "mean":
-            return ops.mean(loss)
         if self.reduction == "sum":
             return ops.sum(loss)
         return loss  # 'none'

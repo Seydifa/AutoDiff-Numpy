@@ -45,6 +45,27 @@ from .vjp_rules import (
     _reshape,
     _concatenate,
     _stack,
+    # loss forward functions — single-node VJP-backed ops
+    mse_loss as _mse_loss_fn,
+    mae_loss as _mae_loss_fn,
+    huber_loss as _huber_loss_fn,
+    log_cosh_loss as _log_cosh_loss_fn,
+    bce_loss as _bce_loss_fn,
+    bce_with_logits_loss as _bce_with_logits_loss_fn,
+    cce_loss as _cce_loss_fn,
+    cce_with_logits_loss as _cce_with_logits_loss_fn,
+    sparse_cce_with_logits_loss as _sparse_cce_with_logits_loss_fn,
+    nll_loss as _nll_loss_fn,
+    kl_divergence_loss as _kl_divergence_loss_fn,
+    focal_loss as _focal_loss_fn,
+    hinge_loss as _hinge_loss_fn,
+    squared_hinge_loss as _squared_hinge_loss_fn,
+    cosine_embedding_loss as _cosine_embedding_loss_fn,
+    triplet_margin_loss as _triplet_margin_loss_fn,
+    dice_loss as _dice_loss_fn,
+    tversky_loss as _tversky_loss_fn,
+    wasserstein_loss as _wasserstein_loss_fn,
+    ssim_loss as _ssim_loss_fn,
 )
 
 
@@ -441,6 +462,33 @@ gather = _GatherOps(_gather_forward, name="gather")
 
 
 # ---------------------------------------------------------------------------
+# Loss functions — single graph node + direct VJP (no intermediate ops tree)
+# ---------------------------------------------------------------------------
+mse_loss = Ops(_mse_loss_fn, name="mse_loss")
+mae_loss = Ops(_mae_loss_fn, name="mae_loss")
+huber_loss = Ops(_huber_loss_fn, name="huber_loss")
+log_cosh_loss = Ops(_log_cosh_loss_fn, name="log_cosh_loss")
+bce_loss = Ops(_bce_loss_fn, name="bce_loss")
+bce_with_logits_loss = Ops(_bce_with_logits_loss_fn, name="bce_with_logits_loss")
+cce_loss = Ops(_cce_loss_fn, name="cce_loss")
+cce_with_logits_loss = Ops(_cce_with_logits_loss_fn, name="cce_with_logits_loss")
+sparse_cce_with_logits_loss = Ops(
+    _sparse_cce_with_logits_loss_fn, name="sparse_cce_with_logits_loss"
+)
+nll_loss = Ops(_nll_loss_fn, name="nll_loss")
+kl_divergence_loss = Ops(_kl_divergence_loss_fn, name="kl_divergence_loss")
+focal_loss = Ops(_focal_loss_fn, name="focal_loss")
+hinge_loss = Ops(_hinge_loss_fn, name="hinge_loss")
+squared_hinge_loss = Ops(_squared_hinge_loss_fn, name="squared_hinge_loss")
+cosine_embedding_loss = Ops(_cosine_embedding_loss_fn, name="cosine_embedding_loss")
+triplet_margin_loss = Ops(_triplet_margin_loss_fn, name="triplet_margin_loss")
+dice_loss = Ops(_dice_loss_fn, name="dice_loss")
+tversky_loss = Ops(_tversky_loss_fn, name="tversky_loss")
+wasserstein_loss = Ops(_wasserstein_loss_fn, name="wasserstein_loss")
+ssim_loss = Ops(_ssim_loss_fn, name="ssim_loss")
+
+
+# ---------------------------------------------------------------------------
 # Array creation helpers — return Tensors so they are graph-compatible
 # ---------------------------------------------------------------------------
 
@@ -647,4 +695,25 @@ __all__ = [
     "repeat",
     "where",
     "gather",
+    # loss functions (single-node VJP-backed)
+    "mse_loss",
+    "mae_loss",
+    "huber_loss",
+    "log_cosh_loss",
+    "bce_loss",
+    "bce_with_logits_loss",
+    "cce_loss",
+    "cce_with_logits_loss",
+    "sparse_cce_with_logits_loss",
+    "nll_loss",
+    "kl_divergence_loss",
+    "focal_loss",
+    "hinge_loss",
+    "squared_hinge_loss",
+    "cosine_embedding_loss",
+    "triplet_margin_loss",
+    "dice_loss",
+    "tversky_loss",
+    "wasserstein_loss",
+    "ssim_loss",
 ]
