@@ -373,8 +373,10 @@ class Conv2d(Module):
                 pad_h = pad_w = 0
             else:
                 raise ValueError(f"Unknown padding mode: {pad}")
+        elif isinstance(pad, (tuple, list)):
+            pad_h, pad_w = int(pad[0]), int(pad[1])
         else:
-            pad_h = pad_w = pad
+            pad_h = pad_w = int(pad)
 
         # Apply padding — stays on the input device (CPU or GPU)
         xp = get_xp(x.data)
