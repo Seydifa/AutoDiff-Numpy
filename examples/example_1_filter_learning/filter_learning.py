@@ -119,7 +119,8 @@ def main():
             loss = criterion(pred, Y_tensor)
 
         # --- Backward Pass ---
-        W_learned.grad.fill(0.0)
+        if W_learned.grad is not None:
+            W_learned.grad.fill(0.0)
         loss.backward()
 
         # Capture computation graph at epoch 0
