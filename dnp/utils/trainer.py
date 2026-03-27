@@ -286,17 +286,35 @@ class Trainer:
         scheduler=None,
         callbacks: List[Callback] | None = None,
         verbose: bool = True,
+        max_grad_norm: float | None = 1.0,
     ):
         self.model = model
         self.optimizer = optimizer
         self.loss_fn = loss_fn
         self.scheduler = scheduler
+        self.max_grad_norm = max_grad_norm
 
         self._callbacks: List[Callback] = list(callbacks or [])
         if verbose and not any(isinstance(c, ProgressLogger) for c in self._callbacks):
             self._callbacks.insert(0, ProgressLogger())
 
     # ------------------------------------------------------------------ helpers
+
+    def _clip_grad_norm(self, max_norm: float) -> None:
+        """Clip gradients of all parameters to *max_norm* (global norm)."""
+        grads = [
+            as_numpy(p.grad)
+            for p in self.model.parameters()
+            if p.grad is not None
+        ]
+        if not grads:
+            return
+        total_norm = float(np.sqrt(sum((g ** 2).sum() for g in grads)))
+        if total_norm > max_norm:
+            clip_coef = max_norm / (total_norm + 1e-6)
+            for p in self.model.parameters():
+                if p.grad is not None:
+                    p.grad *= clip_coef
 
     def _call_callbacks(self, hook: str, *args, **kwargs) -> bool:
         """Call *hook* on all callbacks; return True if any requests stop."""
@@ -347,6 +365,7 @@ class Trainer:
 
         for epoch in range(epochs):
             self._call_callbacks("on_epoch_begin", epoch, {})
+            self.model.train()  # ensure dropout / BN are in training mode
 
             if shuffle:
                 idx = np.random.permutation(n_samples)
@@ -375,6 +394,8 @@ class Trainer:
 
                 # --- backward ---
                 loss.backward()
+                if self.max_grad_norm is not None:
+                    self._clip_grad_norm(self.max_grad_norm)
                 self.optimizer.step()
                 session.reset()
 
@@ -390,7 +411,9 @@ class Trainer:
             # --- validation ---
             if validation_data is not None:
                 x_val, y_val = validation_data
+                self.model.eval()   # disable dropout for validation
                 val_loss = self.evaluate(x_val, y_val, batch_size=batch_size)
+                self.model.train()  # restore train mode
                 logs["val_loss"] = val_loss
                 history.history.setdefault("val_loss", []).append(val_loss)
 
@@ -428,6 +451,8 @@ class Trainer:
 
         total_loss = 0.0
         n_batches = 0
+        was_training = getattr(self.model, "training", True)
+        self.model.eval()  # disable dropout during evaluation
 
         for batch_start in range(0, x.shape[0], batch_size):
             bx = x[batch_start : batch_start + batch_size]
@@ -442,6 +467,8 @@ class Trainer:
             total_loss += float(loss)
             n_batches += 1
 
+        if was_training:
+            self.model.train()  # restore original mode
         return total_loss / max(n_batches, 1)
 
     def predict(self, x: np.ndarray, batch_size: int = 256) -> np.ndarray:
@@ -526,6 +553,7 @@ def _copy_weights(model) -> list:
 def _restore_weights(model, weights: list) -> None:
     """Overwrite parameter arrays with *weights* (in the same order)."""
     from ..core.backend import to_device
+
     for p, w in zip(model.parameters(), weights):
         p.data[...] = to_device(w, p.device)
 
