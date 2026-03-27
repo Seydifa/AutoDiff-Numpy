@@ -363,6 +363,7 @@ class Trainer:
                 self._call_callbacks("on_batch_begin", batch, {})
 
                 # --- forward ---
+                self.optimizer.zero_grad()
                 with session.graph():
                     from ..core.tensor import Tensor
 
