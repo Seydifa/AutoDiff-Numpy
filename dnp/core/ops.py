@@ -305,17 +305,202 @@ def dropout_kernel_call(op, x, p=0.5, training=True):
 
 
 # ===========================================================================
-# 4. Auto-generate Ops for every public function registered in VJP_RULES
-#    Public = name does not start with "_"
-#    vjp_fn is passed explicitly so each Ops instance owns its VJP at init.
+# 4. Explicit Ops construction — one entry per op, no globals() manipulation.
+#    Each line: name = Ops(forward_fn, vjp_fn=VJP_RULES[forward_fn], name=...)
+#    Private-named helpers (_reshape / _concatenate / _stack) are in section 5.
+#    Ops that need a kernel_call override (where, dropout, gather, embedding,
+#    embedding_lookup) are built in section 6 — not listed here.
 # ===========================================================================
 
-for _fn, _vjp_fn in VJP_RULES.items():
-    _n = getattr(_fn, "__name__", None)
-    if _n and not _n.startswith("_"):
-        globals()[_n] = Ops(_fn, vjp_fn=_vjp_fn, name=_n)
+# ── Binary element-wise ──────────────────────────────────────────────────────
+add = Ops(backend.add, vjp_fn=VJP_RULES[backend.add], name="add")
+subtract = Ops(backend.subtract, vjp_fn=VJP_RULES[backend.subtract], name="subtract")
+multiply = Ops(backend.multiply, vjp_fn=VJP_RULES[backend.multiply], name="multiply")
+divide = Ops(backend.divide, vjp_fn=VJP_RULES[backend.divide], name="divide")
+power = Ops(backend.power, vjp_fn=VJP_RULES[backend.power], name="power")
+maximum = Ops(backend.maximum, vjp_fn=VJP_RULES[backend.maximum], name="maximum")
+minimum = Ops(backend.minimum, vjp_fn=VJP_RULES[backend.minimum], name="minimum")
+matmul = Ops(backend.matmul, vjp_fn=VJP_RULES[backend.matmul], name="matmul")
+dot = Ops(backend.dot, vjp_fn=VJP_RULES[backend.dot], name="dot")
 
-del _fn, _vjp_fn, _n  # clean up loop variables
+# ── Unary element-wise ───────────────────────────────────────────────────────
+negative = Ops(backend.negative, vjp_fn=VJP_RULES[backend.negative], name="negative")
+square = Ops(backend.square, vjp_fn=VJP_RULES[backend.square], name="square")
+sqrt = Ops(backend.sqrt, vjp_fn=VJP_RULES[backend.sqrt], name="sqrt")
+exp = Ops(backend.exp, vjp_fn=VJP_RULES[backend.exp], name="exp")
+log = Ops(backend.log, vjp_fn=VJP_RULES[backend.log], name="log")
+log1p = Ops(backend.log1p, vjp_fn=VJP_RULES[backend.log1p], name="log1p")
+expm1 = Ops(backend.expm1, vjp_fn=VJP_RULES[backend.expm1], name="expm1")
+absolute = Ops(backend.abs, vjp_fn=VJP_RULES[backend.abs], name="absolute")
+sign = Ops(backend.sign, vjp_fn=VJP_RULES[backend.sign], name="sign")
+
+# ── Trigonometric & hyperbolic ───────────────────────────────────────────────
+sin = Ops(backend.sin, vjp_fn=VJP_RULES[backend.sin], name="sin")
+cos = Ops(backend.cos, vjp_fn=VJP_RULES[backend.cos], name="cos")
+tan = Ops(backend.tan, vjp_fn=VJP_RULES[backend.tan], name="tan")
+sinh = Ops(backend.sinh, vjp_fn=VJP_RULES[backend.sinh], name="sinh")
+cosh = Ops(backend.cosh, vjp_fn=VJP_RULES[backend.cosh], name="cosh")
+tanh = Ops(backend.tanh, vjp_fn=VJP_RULES[backend.tanh], name="tanh")
+
+# ── Rounding ─────────────────────────────────────────────────────────────────
+floor = Ops(backend.floor, vjp_fn=VJP_RULES[backend.floor], name="floor")
+ceil = Ops(backend.ceil, vjp_fn=VJP_RULES[backend.ceil], name="ceil")
+round = Ops(backend.round, vjp_fn=VJP_RULES[backend.round], name="round")
+
+# ── Reductions ────────────────────────────────────────────────────────────────
+sum = Ops(backend.sum, vjp_fn=VJP_RULES[backend.sum], name="sum")
+mean = Ops(backend.mean, vjp_fn=VJP_RULES[backend.mean], name="mean")
+prod = Ops(backend.prod, vjp_fn=VJP_RULES[backend.prod], name="prod")
+max = Ops(backend.max, vjp_fn=VJP_RULES[backend.max], name="max")
+min = Ops(backend.min, vjp_fn=VJP_RULES[backend.min], name="min")
+
+# ── Shape ─────────────────────────────────────────────────────────────────────
+transpose = Ops(
+    backend.transpose, vjp_fn=VJP_RULES[backend.transpose], name="transpose"
+)
+expand_dims = Ops(
+    backend.expand_dims, vjp_fn=VJP_RULES[backend.expand_dims], name="expand_dims"
+)
+squeeze = Ops(backend.squeeze, vjp_fn=VJP_RULES[backend.squeeze], name="squeeze")
+
+# ── Array manipulation ────────────────────────────────────────────────────────
+clip = Ops(backend.clip, vjp_fn=VJP_RULES[backend.clip], name="clip")
+cumsum = Ops(backend.cumsum, vjp_fn=VJP_RULES[backend.cumsum], name="cumsum")
+flip = Ops(backend.flip, vjp_fn=VJP_RULES[backend.flip], name="flip")
+roll = Ops(backend.roll, vjp_fn=VJP_RULES[backend.roll], name="roll")
+tile = Ops(backend.tile, vjp_fn=VJP_RULES[backend.tile], name="tile")
+repeat = Ops(backend.repeat, vjp_fn=VJP_RULES[backend.repeat], name="repeat")
+
+# ── NN activations ────────────────────────────────────────────────────────────
+sigmoid = Ops(rules.sigmoid, vjp_fn=VJP_RULES[rules.sigmoid], name="sigmoid")
+relu = Ops(rules.relu, vjp_fn=VJP_RULES[rules.relu], name="relu")
+leaky_relu = Ops(
+    rules.leaky_relu, vjp_fn=VJP_RULES[rules.leaky_relu], name="leaky_relu"
+)
+elu = Ops(rules.elu, vjp_fn=VJP_RULES[rules.elu], name="elu")
+softplus = Ops(rules.softplus, vjp_fn=VJP_RULES[rules.softplus], name="softplus")
+swish = Ops(rules.swish, vjp_fn=VJP_RULES[rules.swish], name="swish")
+gelu = Ops(rules.gelu, vjp_fn=VJP_RULES[rules.gelu], name="gelu")
+softmax = Ops(rules.softmax, vjp_fn=VJP_RULES[rules.softmax], name="softmax")
+
+# ── Convolution & pooling ─────────────────────────────────────────────────────
+conv2d = Ops(rules.conv2d, vjp_fn=VJP_RULES[rules.conv2d], name="conv2d")
+conv2d_nd = Ops(rules.conv2d_nd, vjp_fn=VJP_RULES[rules.conv2d_nd], name="conv2d_nd")
+max_pool2d = Ops(
+    rules.max_pool2d, vjp_fn=VJP_RULES[rules.max_pool2d], name="max_pool2d"
+)
+avg_pool2d = Ops(
+    rules.avg_pool2d, vjp_fn=VJP_RULES[rules.avg_pool2d], name="avg_pool2d"
+)
+batch_norm = Ops(
+    rules.batch_norm, vjp_fn=VJP_RULES[rules.batch_norm], name="batch_norm"
+)
+
+# ── Recurrent / sequence ──────────────────────────────────────────────────────
+rnn_cell = Ops(rules.rnn_cell, vjp_fn=VJP_RULES[rules.rnn_cell], name="rnn_cell")
+lstm_cell = Ops(rules.lstm_cell, vjp_fn=VJP_RULES[rules.lstm_cell], name="lstm_cell")
+gru_cell = Ops(rules.gru_cell, vjp_fn=VJP_RULES[rules.gru_cell], name="gru_cell")
+
+# ── Normalization & attention ─────────────────────────────────────────────────
+layer_norm = Ops(
+    rules.layer_norm, vjp_fn=VJP_RULES[rules.layer_norm], name="layer_norm"
+)
+scaled_dot_product_attention = Ops(
+    rules.scaled_dot_product_attention,
+    vjp_fn=VJP_RULES[rules.scaled_dot_product_attention],
+    name="scaled_dot_product_attention",
+)
+rope = Ops(rules.rope, vjp_fn=VJP_RULES[rules.rope], name="rope")
+flash_attention = Ops(
+    rules.flash_attention,
+    vjp_fn=VJP_RULES[rules.flash_attention],
+    name="flash_attention",
+)
+
+# ── Advanced / research ───────────────────────────────────────────────────────
+sinkhorn = Ops(rules.sinkhorn, vjp_fn=VJP_RULES[rules.sinkhorn], name="sinkhorn")
+neural_ode_solve = Ops(
+    rules.neural_ode_solve,
+    vjp_fn=VJP_RULES[rules.neural_ode_solve],
+    name="neural_ode_solve",
+)
+s4_scan = Ops(rules.s4_scan, vjp_fn=VJP_RULES[rules.s4_scan], name="s4_scan")
+
+# ── Loss functions ────────────────────────────────────────────────────────────
+mse_loss = Ops(rules.mse_loss, vjp_fn=VJP_RULES[rules.mse_loss], name="mse_loss")
+mae_loss = Ops(rules.mae_loss, vjp_fn=VJP_RULES[rules.mae_loss], name="mae_loss")
+huber_loss = Ops(
+    rules.huber_loss, vjp_fn=VJP_RULES[rules.huber_loss], name="huber_loss"
+)
+log_cosh_loss = Ops(
+    rules.log_cosh_loss, vjp_fn=VJP_RULES[rules.log_cosh_loss], name="log_cosh_loss"
+)
+bce_loss = Ops(rules.bce_loss, vjp_fn=VJP_RULES[rules.bce_loss], name="bce_loss")
+bce_with_logits_loss = Ops(
+    rules.bce_with_logits_loss,
+    vjp_fn=VJP_RULES[rules.bce_with_logits_loss],
+    name="bce_with_logits_loss",
+)
+cce_loss = Ops(rules.cce_loss, vjp_fn=VJP_RULES[rules.cce_loss], name="cce_loss")
+cce_with_logits_loss = Ops(
+    rules.cce_with_logits_loss,
+    vjp_fn=VJP_RULES[rules.cce_with_logits_loss],
+    name="cce_with_logits_loss",
+)
+sparse_cce_with_logits_loss = Ops(
+    rules.sparse_cce_with_logits_loss,
+    vjp_fn=VJP_RULES[rules.sparse_cce_with_logits_loss],
+    name="sparse_cce_with_logits_loss",
+)
+nll_loss = Ops(rules.nll_loss, vjp_fn=VJP_RULES[rules.nll_loss], name="nll_loss")
+kl_divergence_loss = Ops(
+    rules.kl_divergence_loss,
+    vjp_fn=VJP_RULES[rules.kl_divergence_loss],
+    name="kl_divergence_loss",
+)
+focal_loss = Ops(
+    rules.focal_loss, vjp_fn=VJP_RULES[rules.focal_loss], name="focal_loss"
+)
+hinge_loss = Ops(
+    rules.hinge_loss, vjp_fn=VJP_RULES[rules.hinge_loss], name="hinge_loss"
+)
+squared_hinge_loss = Ops(
+    rules.squared_hinge_loss,
+    vjp_fn=VJP_RULES[rules.squared_hinge_loss],
+    name="squared_hinge_loss",
+)
+cosine_embedding_loss = Ops(
+    rules.cosine_embedding_loss,
+    vjp_fn=VJP_RULES[rules.cosine_embedding_loss],
+    name="cosine_embedding_loss",
+)
+triplet_margin_loss = Ops(
+    rules.triplet_margin_loss,
+    vjp_fn=VJP_RULES[rules.triplet_margin_loss],
+    name="triplet_margin_loss",
+)
+dice_loss = Ops(rules.dice_loss, vjp_fn=VJP_RULES[rules.dice_loss], name="dice_loss")
+tversky_loss = Ops(
+    rules.tversky_loss, vjp_fn=VJP_RULES[rules.tversky_loss], name="tversky_loss"
+)
+wasserstein_loss = Ops(
+    rules.wasserstein_loss,
+    vjp_fn=VJP_RULES[rules.wasserstein_loss],
+    name="wasserstein_loss",
+)
+ssim_loss = Ops(rules.ssim_loss, vjp_fn=VJP_RULES[rules.ssim_loss], name="ssim_loss")
+
+# ── Fourier transforms ────────────────────────────────────────────────────────
+fft = Ops(backend.scipy.fft.fft, vjp_fn=VJP_RULES[backend.scipy.fft.fft], name="fft")
+ifft = Ops(
+    backend.scipy.fft.ifft, vjp_fn=VJP_RULES[backend.scipy.fft.ifft], name="ifft"
+)
+fftn = Ops(
+    backend.scipy.fft.fftn, vjp_fn=VJP_RULES[backend.scipy.fft.fftn], name="fftn"
+)
+ifftn = Ops(
+    backend.scipy.fft.ifftn, vjp_fn=VJP_RULES[backend.scipy.fft.ifftn], name="ifftn"
+)
 
 
 # ===========================================================================
