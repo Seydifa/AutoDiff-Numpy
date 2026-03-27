@@ -257,11 +257,10 @@ class BackendWrapper:
 # ---------------------------------------------------------------------------
 # Singleton backend instance
 # ---------------------------------------------------------------------------
-# Always start on CPU (NumPy).  Call backend.set_device('cuda') or
-# dnp.set_device('cuda') to switch to CuPy.  Auto-switching based on
-# CUDA availability would capture CuPy ufuncs inside Ops at import time,
-# making CPU mode fail later when set_device('cpu') is called.
-backend = BackendWrapper(np)
+if is_cuda_available:
+    backend = BackendWrapper(cp)
+else:
+    backend = BackendWrapper(np)
 
 # ---------------------------------------------------------------------------
 # Global dtype registry

@@ -439,20 +439,6 @@ def _avg_pool2d_backward(g, x, kernel_size, stride=1, padding=0):
 
     g_scaled = g / (kH * kW)  # (B, C, H_out, W_out)
 
-    # ---- absolute h/w positions for every (output pos, kernel offset) ------
-    # kh_off, kw_off: kernel offsets (kH, 1) and (1, kW)
-    kh_off = backend.arange(kH, dtype=backend.int64).reshape(kH, 1)
-    kw_off = backend.arange(kW, dtype=backend.int64).reshape(1, kW)
-
-    # h_base, w_base: output-position-based start of each window
-    # shapes: (H_out, 1) and (1, W_out)
-    h_base = backend.arange(H_out, dtype=backend.int64).reshape(H_out, 1) * sH
-    w_base = backend.arange(W_out, dtype=backend.int64).reshape(1, W_out) * sW
-
-    # abs_h: (H_out, kH)  abs_w: (W_out, kW)
-    abs_h = (h_base + kh_off.T).T  # broadcast (H_out,1)+(kH,1)→(kH,H_out) → T
-    abs_w = (w_base + kw_off).T  # (W_out, kW)
-
     # ---- expand for full scatter call (B, C, H_out, W_out, kH, kW) --------
     # We loop over kH*kW — but that's a Python-level loop over *kernel offsets*
     # (typically 9 iters for 3×3), and every iter is a fully vectorized
