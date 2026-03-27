@@ -390,7 +390,7 @@ class Trainer:
             # --- validation ---
             if validation_data is not None:
                 x_val, y_val = validation_data
-                val_loss = self.evaluate(x_val, y_val)
+                val_loss = self.evaluate(x_val, y_val, batch_size=batch_size)
                 logs["val_loss"] = val_loss
                 history.history.setdefault("val_loss", []).append(val_loss)
 
