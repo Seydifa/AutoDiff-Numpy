@@ -61,6 +61,10 @@ from .ops import (
     swish,
     gelu,
     softmax,
+    fft,
+    ifft,
+    fftn,
+    ifftn,
     max_pool2d,
     avg_pool2d,
     dropout,
@@ -89,14 +93,26 @@ from .ops import (
     gather,
 )
 
-# Local imports: Neural network layers (centralized in core/layers.py)
-from .layers import (
+# Global imports: Framework layers
+from dnp.layers import (
     Module,
     Linear,
+    Conv1d,
+    Conv1d,
     Conv2d,
     MaxPool2d,
     AvgPool2d,
+    GlobalAvgPool1d,
+    GlobalMaxPool1d,
+    GlobalAvgPool2d,
+    GlobalMaxPool2d,
     Flatten,
+    Reshape,
+    ExpandDims,
+    Squeeze,
+    Repeat,
+    Concatenate,
+    Stack,
     Sequential,
     BatchNorm1d,
     BatchNorm2d,
@@ -120,8 +136,27 @@ from .layers import (
     TransformerEncoderLayer,
     CrossEntropyLoss,
     MSELoss,
+    MAELoss,
+    L1Loss,
+    HuberLoss,
+    SmoothL1Loss,
+    LogCoshLoss,
     BCELoss,
     BCEWithLogitsLoss,
+    NLLLoss,
+    KLDivLoss,
+    FocalLoss,
+    HingeLoss,
+    SquaredHingeLoss,
+    # New Adv
+    FlashAttention,
+    RotaryPositionalEncoding,
+    SinkhornTransport,
+    NeuralODE,
+    S4Layer,
+    RNN,
+    LSTM,
+    GRU,
 )
 
 # Local imports: Optimization algorithms
@@ -200,6 +235,11 @@ __all__ = [
     "swish",
     "gelu",
     "softmax",
+    # Fourier Transforms
+    "fft",
+    "ifft",
+    "fftn",
+    "ifftn",
     # Pooling operations (vectorized)
     "max_pool2d",
     "avg_pool2d",
@@ -235,10 +275,22 @@ __all__ = [
     # Linear/Dense layers
     "Linear",
     # Convolutional layers
+    "Conv1d",
     "Conv2d",
     # Pooling layers
     "MaxPool2d",
     "AvgPool2d",
+    "GlobalAvgPool1d",
+    "GlobalMaxPool1d",
+    "GlobalAvgPool2d",
+    "GlobalMaxPool2d",
+    "Flatten",
+    "Reshape",
+    "ExpandDims",
+    "Squeeze",
+    "Repeat",
+    "Concatenate",
+    "Stack",
     # Activation layers
     "ReLU",
     "Sigmoid",
@@ -260,8 +312,18 @@ __all__ = [
     # Loss layers
     "CrossEntropyLoss",
     "MSELoss",
+    "MAELoss",
+    "L1Loss",
+    "HuberLoss",
+    "SmoothL1Loss",
+    "LogCoshLoss",
     "BCELoss",
     "BCEWithLogitsLoss",
+    "NLLLoss",
+    "KLDivLoss",
+    "FocalLoss",
+    "HingeLoss",
+    "SquaredHingeLoss",
     # Attention layers
     "ScaledDotProductAttention",
     "MultiHeadAttention",
@@ -270,6 +332,15 @@ __all__ = [
     "PositionalEncoding",
     "FeedForward",
     "TransformerEncoderLayer",
+    # Advanced mechanisms
+    "FlashAttention",
+    "RotaryPositionalEncoding",
+    "SinkhornTransport",
+    "NeuralODE",
+    "S4Layer",
+    "RNN",
+    "LSTM",
+    "GRU",
     # Utility layers
     "Flatten",
     # Optimization algorithms
@@ -289,14 +360,25 @@ __all__ = [
     "WarmupScheduler",
 ]
 
-# Local imports: Neural network layers (centralized in core/layers.py)
-from .layers import (
+# Global imports: Framework layers
+from dnp.layers import (
     Module,
     Linear,
+    Conv1d,
     Conv2d,
     MaxPool2d,
     AvgPool2d,
+    GlobalAvgPool1d,
+    GlobalMaxPool1d,
+    GlobalAvgPool2d,
+    GlobalMaxPool2d,
     Flatten,
+    Reshape,
+    ExpandDims,
+    Squeeze,
+    Repeat,
+    Concatenate,
+    Stack,
     Sequential,
     BatchNorm1d,
     BatchNorm2d,
@@ -308,6 +390,14 @@ from .layers import (
     ScaledDotProductAttention,
     MultiHeadAttention,
     SelfAttention,
+    FlashAttention,
+    RotaryPositionalEncoding,
+    SinkhornTransport,
+    NeuralODE,
+    S4Layer,
+    RNN,
+    LSTM,
+    GRU,
 )
 
 # Local imports: Optimization algorithms
@@ -378,6 +468,11 @@ __all__ = [
     "swish",
     "gelu",
     "softmax",
+    # Fourier Transforms
+    "fft",
+    "ifft",
+    "fftn",
+    "ifftn",
     # Pooling operations (vectorized)
     "max_pool2d",
     "avg_pool2d",
@@ -391,10 +486,22 @@ __all__ = [
     # Linear/Dense layers
     "Linear",
     # Convolutional layers
+    "Conv1d",
     "Conv2d",
     # Pooling layers
     "MaxPool2d",
     "AvgPool2d",
+    "GlobalAvgPool1d",
+    "GlobalMaxPool1d",
+    "GlobalAvgPool2d",
+    "GlobalMaxPool2d",
+    "Flatten",
+    "Reshape",
+    "ExpandDims",
+    "Squeeze",
+    "Repeat",
+    "Concatenate",
+    "Stack",
     # Activation layers
     "ReLU",
     "Sigmoid",
@@ -409,6 +516,15 @@ __all__ = [
     "ScaledDotProductAttention",
     "MultiHeadAttention",
     "SelfAttention",
+    # Advanced AI mechanisms
+    "FlashAttention",
+    "RotaryPositionalEncoding",
+    "SinkhornTransport",
+    "NeuralODE",
+    "S4Layer",
+    "RNN",
+    "LSTM",
+    "GRU",
     # Utility layers
     "Flatten",
     # Optimization algorithms

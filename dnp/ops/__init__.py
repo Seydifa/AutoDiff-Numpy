@@ -59,6 +59,10 @@ from dnp.core.ops import (
     gelu,
     softmax,
     gather,
+    fft,
+    ifft,
+    fftn,
+    ifftn,
 )
 
 __all__ = [
@@ -118,4 +122,8 @@ __all__ = [
     "gelu",
     "softmax",
     "gather",
+    "fft",
+    "ifft",
+    "fftn",
+    "ifftn",
 ]

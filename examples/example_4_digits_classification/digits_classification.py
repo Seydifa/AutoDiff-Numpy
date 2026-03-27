@@ -93,14 +93,14 @@ def main():
     print("\n3. Setting up training components...")
 
     criterion = dnp.CrossEntropyLoss()  # accepts logits + integer labels
-    optimizer = dnp.Adam(model.parameters(), lr=0.005)
-    scheduler = dnp.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
-    early_stop = dnp.EarlyStopping(monitor="val_loss", patience=10, verbose=True)
+    optimizer = dnp.Adam(model.parameters(), lr=0.001)
+    scheduler = dnp.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
+    early_stop = dnp.EarlyStopping(monitor="val_loss", patience=20, verbose=True)
 
     print(f"  Loss:      CrossEntropyLoss")
-    print(f"  Optimizer: Adam (lr=0.005)")
-    print(f"  Scheduler: ReduceLROnPlateau (patience=5, factor=0.5)")
-    print(f"  Callback:  EarlyStopping (patience=10, monitor=val_loss)")
+    print(f"  Optimizer: Adam (lr=0.001)")
+    print(f"  Scheduler: ReduceLROnPlateau (patience=10, factor=0.5)")
+    print(f"  Callback:  EarlyStopping (patience=20, monitor=val_loss)")
 
     # Capture computation graph (one forward pass, no backward)
     out_path = (
@@ -133,7 +133,7 @@ def main():
     history = trainer.fit(
         X_train,
         y_train_f,
-        epochs=40,
+        epochs=100,
         batch_size=64,
         validation_data=(X_test, y_test_f),
     )

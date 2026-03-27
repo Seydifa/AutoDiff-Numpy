@@ -29,15 +29,16 @@ Tensor = dnp.Tensor
 class RegressionNetwork(dnp.Module):
     """Simple regression network with one hidden layer."""
 
-    def __init__(self, hidden_dim=16):
+    def __init__(self, hidden_dim=32):
         super().__init__()
-        self.fc1 = dnp.Linear(1, hidden_dim, name="Hidden")
-        self.fc2 = dnp.Linear(hidden_dim, 1, name="Output")
+        self.fc1 = dnp.Linear(1, hidden_dim, name="Hidden1")
+        self.fc2 = dnp.Linear(hidden_dim, hidden_dim, name="Hidden2")
+        self.fc3 = dnp.Linear(hidden_dim, 1, name="Output")
 
     def forward(self, x):
-        h = self.fc1(x)
-        h = dnp.ops.relu(h)
-        return self.fc2(h)
+        h = dnp.ops.relu(self.fc1(x))
+        h = dnp.ops.relu(self.fc2(h))
+        return self.fc3(h)
 
 
 def generate_synthetic_data(n_samples=100, noise_std=0.1):
@@ -78,9 +79,9 @@ def main():
     print("\n2. Initializing regression network...")
 
     np.random.seed(42)
-    model = RegressionNetwork(hidden_dim=16)
+    model = RegressionNetwork(hidden_dim=32)
 
-    print("  Architecture: 1 → Dense(16, ReLU) → Dense(1)")
+    print("  Architecture: 1 → Dense(32, ReLU) → Dense(32, ReLU) → Dense(1)")
     param_count = sum(p.size for p in model.parameters())
     print(f"  Total parameters: {param_count}")
 
@@ -90,14 +91,14 @@ def main():
     print("\n3. Setting up training components...")
 
     criterion = dnp.MSELoss()
-    optimizer = dnp.Adam(model.parameters(), lr=0.01)
-    scheduler = dnp.ReduceLROnPlateau(optimizer, patience=20, factor=0.5)
-    early_stop = dnp.EarlyStopping(monitor="val_loss", patience=40, verbose=True)
+    optimizer = dnp.Adam(model.parameters(), lr=0.001)
+    scheduler = dnp.ReduceLROnPlateau(optimizer, patience=30, factor=0.5)
+    early_stop = dnp.EarlyStopping(monitor="val_loss", patience=60, verbose=True)
 
     print(f"  Loss:      MSELoss")
-    print(f"  Optimizer: Adam (lr=0.01)")
-    print(f"  Scheduler: ReduceLROnPlateau (patience=20, factor=0.5)")
-    print(f"  Callback:  EarlyStopping (patience=40, monitor=val_loss)")
+    print(f"  Optimizer: Adam (lr=0.001)")
+    print(f"  Scheduler: ReduceLROnPlateau (patience=30, factor=0.5)")
+    print(f"  Callback:  EarlyStopping (patience=60, monitor=val_loss)")
 
     # Capture computation graph before training starts
     out_path = (
@@ -130,7 +131,7 @@ def main():
     history = trainer.fit(
         X_train,
         Y_train,
-        epochs=300,
+        epochs=500,
         batch_size=32,
         validation_data=(X_test, Y_test),
     )

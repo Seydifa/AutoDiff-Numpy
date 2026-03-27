@@ -26,7 +26,7 @@ import math
 from typing import List, Dict, Any, Optional
 
 # Local imports
-from .backend import get_xp, safe_eps
+from .backend import backend, safe_eps
 from .session import session
 
 
@@ -66,6 +66,27 @@ class Optimizer:
         """Initialize the optimizer with parameters and learning rate."""
         self.parameters = list(parameters)
         self.lr = lr
+
+    @staticmethod
+    def _param_array(param):
+        return param.data
+
+    def _zeros_like_param(self, param):
+        return backend.zeros_like(self._param_array(param))
+
+    @staticmethod
+    def _sqrt(array):
+        return backend.sqrt(array)
+
+    @staticmethod
+    def _assign_param(param, value) -> None:
+        param[...] = value
+
+    def _iter_params_with_grad(self):
+        for param in self.parameters:
+            grad = getattr(param, "grad", None)
+            if grad is not None:
+                yield param, id(param), grad
 
     def zero_grad(self) -> None:
         """
@@ -142,9 +163,8 @@ class SGD(Optimizer):
             p \\leftarrow p - \\alpha \\nabla L(p)
         """
         with session.no_grad():
-            for p in self.parameters:
-                if p.grad is not None:
-                    p[...] = p.data - self.lr * p.grad
+            for p, _, grad in self._iter_params_with_grad():
+                self._assign_param(p, self._param_array(p) - self.lr * grad)
 
 
 class Adam(Optimizer):
@@ -253,10 +273,10 @@ class Adam(Optimizer):
         # identify each parameter tensor.
         # State is allocated on the same device as the parameter.
         self.m: Dict[int, Any] = {
-            id(p): get_xp(p.data).zeros_like(p.data) for p in self.parameters
+            id(p): self._zeros_like_param(p) for p in self.parameters
         }
         self.v: Dict[int, Any] = {
-            id(p): get_xp(p.data).zeros_like(p.data) for p in self.parameters
+            id(p): self._zeros_like_param(p) for p in self.parameters
         }
 
     def step(self) -> None:
@@ -269,13 +289,7 @@ class Adam(Optimizer):
         """
         self.t += 1
         with session.no_grad():
-            for p in self.parameters:
-                if p.grad is None:
-                    continue
-
-                pid = id(p)
-                grad = p.grad
-
+            for p, pid, grad in self._iter_params_with_grad():
                 # 1. Update biased first moment estimate (exponential moving average)
                 #    m_t = beta1 * m_{t-1} + (1 - beta1) * g_t
                 self.m[pid] = self.beta1 * self.m[pid] + (1.0 - self.beta1) * grad
@@ -300,8 +314,11 @@ class Adam(Optimizer):
                 # The denominator sqrt(v_hat) + epsilon provides adaptive per-parameter
                 # learning rates, reducing the effective learning rate for parameters
                 # with large gradient variance and increasing it for those with small variance
-                xp = get_xp(v_hat)
-                p[...] = p.data - self.lr * m_hat / (xp.sqrt(v_hat) + safe_eps(grad))
+                self._assign_param(
+                    p,
+                    self._param_array(p)
+                    - self.lr * m_hat / (self._sqrt(v_hat) + safe_eps(grad)),
+                )
 
 
 class Momentum(Optimizer):
@@ -375,7 +392,7 @@ class Momentum(Optimizer):
         self.dampening = dampening
         self.nesterov = nesterov
         self.velocity: Dict[int, Any] = {
-            id(p): get_xp(p.data).zeros_like(p.data) for p in self.parameters
+            id(p): self._zeros_like_param(p) for p in self.parameters
         }
 
     def step(self) -> None:
@@ -386,22 +403,19 @@ class Momentum(Optimizer):
         parameter updates, optionally with Nesterov acceleration.
         """
         with session.no_grad():
-            for p in self.parameters:
-                if p.grad is None:
-                    continue
-
-                pid = id(p)
-                grad = p.grad
-
+            for p, pid, grad in self._iter_params_with_grad():
                 # Accumulate velocity: v = momentum * v + (1 - dampening) * grad
                 buf = self.velocity[pid]
                 buf[:] = self.momentum * buf + (1.0 - self.dampening) * grad
 
                 # Update parameters
                 if self.nesterov:
-                    p[...] = p.data - self.lr * (grad + self.momentum * buf)
+                    self._assign_param(
+                        p,
+                        self._param_array(p) - self.lr * (grad + self.momentum * buf),
+                    )
                 else:
-                    p[...] = p.data - self.lr * buf
+                    self._assign_param(p, self._param_array(p) - self.lr * buf)
 
 
 class RMSprop(Optimizer):
@@ -478,11 +492,11 @@ class RMSprop(Optimizer):
         self.centered = centered
 
         self.sq_avg: Dict[int, Any] = {
-            id(p): get_xp(p.data).zeros_like(p.data) for p in self.parameters
+            id(p): self._zeros_like_param(p) for p in self.parameters
         }
         if centered:
             self.buffer: Dict[int, Any] = {
-                id(p): get_xp(p.data).zeros_like(p.data) for p in self.parameters
+                id(p): self._zeros_like_param(p) for p in self.parameters
             }
 
     def step(self) -> None:
@@ -493,13 +507,7 @@ class RMSprop(Optimizer):
         exponentially decaying averages of squared gradients.
         """
         with session.no_grad():
-            for p in self.parameters:
-                if p.grad is None:
-                    continue
-
-                pid = id(p)
-                grad = p.grad
-
+            for p, pid, grad in self._iter_params_with_grad():
                 # Update square gradient average: v = alpha * v + (1-alpha) * g^2
                 self.sq_avg[pid] = self.alpha * self.sq_avg[pid] + (
                     1.0 - self.alpha
@@ -517,8 +525,10 @@ class RMSprop(Optimizer):
                     denominator = self.sq_avg[pid] + safe_eps(grad)
 
                 # Update parameter: p = p - lr * grad / sqrt(denominator)
-                xp = get_xp(denominator)
-                p[...] = p.data - self.lr * grad / xp.sqrt(denominator)
+                self._assign_param(
+                    p,
+                    self._param_array(p) - self.lr * grad / self._sqrt(denominator),
+                )
 
 
 class Adagrad(Optimizer):
@@ -586,7 +596,7 @@ class Adagrad(Optimizer):
         super().__init__(parameters, lr)
         self.epsilon = epsilon
         self.sq_sum: Dict[int, Any] = {
-            id(p): get_xp(p.data).zeros_like(p.data) for p in self.parameters
+            id(p): self._zeros_like_param(p) for p in self.parameters
         }
 
     def step(self) -> None:
@@ -597,20 +607,15 @@ class Adagrad(Optimizer):
         scale the learning rate for each parameter individually.
         """
         with session.no_grad():
-            for p in self.parameters:
-                if p.grad is None:
-                    continue
-
-                pid = id(p)
-                grad = p.grad
-
+            for p, pid, grad in self._iter_params_with_grad():
                 # Accumulate squared gradients: G = G_prev + g^2
                 self.sq_sum[pid] = self.sq_sum[pid] + grad**2
 
                 # Update parameter: p = p - lr * grad / sqrt(G + epsilon)
-                xp = get_xp(self.sq_sum[pid])
-                p[...] = p.data - self.lr * grad / (
-                    xp.sqrt(self.sq_sum[pid]) + safe_eps(grad)
+                self._assign_param(
+                    p,
+                    self._param_array(p)
+                    - self.lr * grad / (self._sqrt(self.sq_sum[pid]) + safe_eps(grad)),
                 )
 
 
@@ -705,10 +710,10 @@ class AdamW(Optimizer):
         self.t = 0
 
         self.m: Dict[int, Any] = {
-            id(p): get_xp(p.data).zeros_like(p.data) for p in self.parameters
+            id(p): self._zeros_like_param(p) for p in self.parameters
         }
         self.v: Dict[int, Any] = {
-            id(p): get_xp(p.data).zeros_like(p.data) for p in self.parameters
+            id(p): self._zeros_like_param(p) for p in self.parameters
         }
 
     def step(self) -> None:
@@ -720,13 +725,7 @@ class AdamW(Optimizer):
         """
         self.t += 1
         with session.no_grad():
-            for p in self.parameters:
-                if p.grad is None:
-                    continue
-
-                pid = id(p)
-                grad = p.grad
-
+            for p, pid, grad in self._iter_params_with_grad():
                 # Update biased first moment estimate
                 self.m[pid] = self.beta1 * self.m[pid] + (1.0 - self.beta1) * grad
 
@@ -740,10 +739,12 @@ class AdamW(Optimizer):
                 # AdamW update: adaptive step + decoupled weight decay
                 # The key difference from Adam: weight decay is applied directly,
                 # not scaled by the adaptive learning rate
-                xp = get_xp(v_hat)
-                adaptive_update = self.lr * m_hat / (xp.sqrt(v_hat) + safe_eps(grad))
-                weight_decay_update = self.weight_decay * self.lr * p.data
-                p[...] = p.data - adaptive_update - weight_decay_update
+                adaptive_update = self.lr * m_hat / (self._sqrt(v_hat) + safe_eps(grad))
+                weight_decay_update = self.weight_decay * self.lr * self._param_array(p)
+                self._assign_param(
+                    p,
+                    self._param_array(p) - adaptive_update - weight_decay_update,
+                )
 
 
 # =============================================================================

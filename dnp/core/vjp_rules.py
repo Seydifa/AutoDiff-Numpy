@@ -17,14 +17,14 @@ operation, define a forward function and decorate its backward with::
 """
 
 # Third-party libraries
-import numpy as np
+from .backend import backend, safe_eps, get_dtype
+from .tensor import Tensor
 
-from .backend import get_xp, safe_eps
 
 EPSILON = 1e-8
 
 # Precomputed constant for GELU — avoids recomputing sqrt on every call.
-_GELU_COEFF = float(np.sqrt(2.0 / np.pi))  # ≈ 0.7978845608028654
+_GELU_COEFF = float(backend.sqrt(2.0 / backend.pi))  # ≈ 0.7978845608028654
 
 # ---------------------------------------------------------------------------
 # VJP_RULES registry
@@ -45,9 +45,9 @@ def vjp_rule(func):
 
     Usage::
 
-        @vjp_rule(func=np.sin)
+        @vjp_rule(func=backend.sin)
         def _vjp_sin(g, x):
-            return (g * get_xp(x).cos(x),)
+            return (g * backend.cos(x),)
 
     The decorated function is stored under ``VJP_RULES[func]`` and returned
     unchanged so it remains directly callable for testing.
@@ -85,21 +85,20 @@ def unbroadcast(grad, target_shape):
 def _restore_reduced_dims(g, x_shape, axis, keepdims):
     """Re-insert squeezed axes into *g* so it broadcasts to *x_shape*.
 
-    Uses ``xp.broadcast_to`` (zero-copy view) instead of ``xp.ones`` allocation.
+    Uses ``backend.broadcast_to`` (zero-copy view) instead of ``backend.ones`` allocation.
     Handles axis=None, int, list, and tuple.  Works on NumPy < 2.0 (no tuple
     axis in expand_dims).
     """
-    xp = get_xp(g)
     if keepdims or axis is None:
         # g is already shaped for broadcasting; broadcast_to makes it explicit.
-        return xp.broadcast_to(g, x_shape).copy()
+        return backend.broadcast_to(g, x_shape).copy()
     if isinstance(axis, (list, tuple)):
         result = g
         for ax in sorted(int(a) % len(x_shape) for a in axis):
-            result = xp.expand_dims(result, ax)
+            result = backend.expand_dims(result, ax)
     else:
-        result = xp.expand_dims(g, int(axis) % len(x_shape))
-    return xp.broadcast_to(result, x_shape).copy()
+        result = backend.expand_dims(g, int(axis) % len(x_shape))
+    return backend.broadcast_to(result, x_shape).copy()
 
 
 # ---------------------------------------------------------------------------
@@ -108,30 +107,25 @@ def _restore_reduced_dims(g, x_shape, axis, keepdims):
 
 
 def sigmoid(x):
-    xp = get_xp(x)
-    x_clipped = xp.clip(x, -500, 500)
-    return 1.0 / (1.0 + xp.exp(-x_clipped))
+    x_clipped = backend.clip(x, -500, 500)
+    return 1.0 / (1.0 + backend.exp(-x_clipped))
 
 
 def relu(x):
-    xp = get_xp(x)
-    return xp.maximum(0.0, x)
+    return backend.maximum(0.0, x)
 
 
 def leaky_relu(x, alpha=0.01):
-    xp = get_xp(x)
-    return xp.where(x > 0, x, alpha * x)
+    return backend.where(x > 0, x, alpha * x)
 
 
 def elu(x, alpha=1.0):
-    xp = get_xp(x)
-    return xp.where(x > 0, x, alpha * (xp.exp(x) - 1.0))
+    return backend.where(x > 0, x, alpha * (backend.exp(x) - 1.0))
 
 
 def softplus(x):
-    xp = get_xp(x)
     # logaddexp(0, x) = log(1 + exp(x)) computed in a numerically stable way.
-    return xp.logaddexp(0.0, x)
+    return backend.logaddexp(0.0, x)
 
 
 def swish(x):
@@ -139,16 +133,14 @@ def swish(x):
 
 
 def gelu(x):
-    xp = get_xp(x)
-    # Use module-level constant (no sqrt per call) and ** instead of xp.power.
-    return 0.5 * x * (1.0 + xp.tanh(_GELU_COEFF * (x + 0.044715 * x**3)))
+    # Use module-level constant (no sqrt per call) and ** instead of backend.power.
+    return 0.5 * x * (1.0 + backend.tanh(_GELU_COEFF * (x + 0.044715 * x**3)))
 
 
 def softmax(x, axis=-1):
-    xp = get_xp(x)
-    x_max = xp.max(x, axis=axis, keepdims=True)
-    e_x = xp.exp(x - x_max)
-    return e_x / xp.sum(e_x, axis=axis, keepdims=True)
+    x_max = backend.max(x, axis=axis, keepdims=True)
+    e_x = backend.exp(x - x_max)
+    return e_x / backend.sum(e_x, axis=axis, keepdims=True)
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +149,6 @@ def softmax(x, axis=-1):
 
 
 def max_pool2d(x, kernel_size, stride=1, padding=0):
-    xp = get_xp(x)
 
     if isinstance(kernel_size, int):
         kernel_size = (kernel_size, kernel_size)
@@ -165,7 +156,7 @@ def max_pool2d(x, kernel_size, stride=1, padding=0):
         stride = (stride, stride)
 
     if padding > 0:
-        x = xp.pad(x, ((0, 0), (0, 0), (padding, padding), (padding, padding)))
+        x = backend.pad(x, ((0, 0), (0, 0), (padding, padding), (padding, padding)))
 
     batch, channels, H, W = x.shape
     kH, kW = kernel_size
@@ -184,12 +175,11 @@ def max_pool2d(x, kernel_size, stride=1, padding=0):
         strides[3],
     )
 
-    x_windowed = xp.lib.stride_tricks.as_strided(x, shape=shape, strides=strides)
-    return xp.max(x_windowed, axis=(4, 5))
+    x_windowed = backend.lib.stride_tricks.as_strided(x, shape=shape, strides=strides)
+    return backend.max(x_windowed, axis=(4, 5))
 
 
 def avg_pool2d(x, kernel_size, stride=1, padding=0):
-    xp = get_xp(x)
 
     if isinstance(kernel_size, int):
         kernel_size = (kernel_size, kernel_size)
@@ -197,7 +187,7 @@ def avg_pool2d(x, kernel_size, stride=1, padding=0):
         stride = (stride, stride)
 
     if padding > 0:
-        x = xp.pad(x, ((0, 0), (0, 0), (padding, padding), (padding, padding)))
+        x = backend.pad(x, ((0, 0), (0, 0), (padding, padding), (padding, padding)))
 
     batch, channels, H, W = x.shape
     kH, kW = kernel_size
@@ -216,8 +206,8 @@ def avg_pool2d(x, kernel_size, stride=1, padding=0):
         strides[3],
     )
 
-    x_windowed = xp.lib.stride_tricks.as_strided(x, shape=shape, strides=strides)
-    return xp.mean(x_windowed, axis=(4, 5))
+    x_windowed = backend.lib.stride_tricks.as_strided(x, shape=shape, strides=strides)
+    return backend.mean(x_windowed, axis=(4, 5))
 
 
 def dropout(x, p=0.5, training=True):
@@ -226,14 +216,12 @@ def dropout(x, p=0.5, training=True):
     """
     if not training or p == 0:
         return x
-    xp = get_xp(x)
-    mask = (xp.random.uniform(size=x.shape) >= p).astype(x.dtype)
+    mask = (backend.random.uniform(size=x.shape) >= p).astype(x.dtype)
     return x * mask / (1 - p)
 
 
 def batch_norm(x, weight, bias, mean, var, eps=1e-5):
-    xp = get_xp(x)
-    x_norm = (x - mean) / xp.sqrt(var + eps)
+    x_norm = (x - mean) / backend.sqrt(var + eps)
     return weight * x_norm + bias
 
 
@@ -245,38 +233,32 @@ def batch_norm(x, weight, bias, mean, var, eps=1e-5):
 def conv2d(x, w, mode="valid"):
     """2D convolution — stays on whichever device x lives on.
 
-    * GPU path : cupyx.scipy.signal.convolve2d  (requires cupyx, no CPU transfer)
-    * CPU path : scipy.signal.convolve2d
-
-    Raises ``RuntimeError`` on GPU if cupyx is not installed, because silently
-    falling back to scipy would force a device→host→device round-trip and
-    corrupt the compute graph's device invariant.
+    Delegates entirely to ``backend.scipy.signal.convolve2d``, which resolves
+    to ``cupyx.scipy.signal`` on GPU or ``scipy.signal`` on CPU — no manual
+    branching or inline imports needed.
     """
-    xp = get_xp(x)
-    if xp.__name__ == "cupy":
-        try:
-            from cupyx.scipy.signal import convolve2d as cp_convolve2d
-        except ImportError as exc:
-            raise RuntimeError(
-                "conv2d on a CuPy array requires cupyx.scipy.signal. "
-                "Install it with:  pip install cupy-cuda12x  (match your CUDA version). "
-                "Falling back to scipy would silently move data off the GPU and is "
-                "therefore disallowed."
-            ) from exc
-        return cp_convolve2d(x, w, mode=mode)
-    else:
-        from scipy.signal import convolve2d as sp_convolve2d
-
-        return sp_convolve2d(x, w, mode=mode)
+    return backend.scipy.signal.convolve2d(x, w, mode=mode)
 
 
 def rot180(w):
-    xp = get_xp(w)
-    return xp.rot90(w, 2)
+    return backend.rot90(w, 2)
 
 
 def conv2d_full(g, w):
     return conv2d(g, w, mode="full")
+
+
+def conv2d_nd(x, W, stride_h=1, stride_w=1, pad_h=0, pad_w=0):
+    if pad_h > 0 or pad_w > 0:
+        x_padded = backend.pad(x, ((0, 0), (0, 0), (pad_h, pad_h), (pad_w, pad_w)))
+    else:
+        x_padded = x
+
+    kH, kW = W.shape[2], W.shape[3]
+    H_out = (x_padded.shape[2] - kH) // stride_h + 1
+    W_out = (x_padded.shape[3] - kW) // stride_w + 1
+
+    return _conv2d_forward_kernel(x_padded, W, stride_h, stride_w, H_out, W_out)
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +272,6 @@ def _conv2d_forward_kernel(x_padded, W, stride_h, stride_w, H_out, W_out):
     Replaces the old 6-level Numba loop with a fully vectorized path that
     works transparently on both NumPy (CPU) and CuPy (GPU) arrays.
     """
-    xp = get_xp(x_padded)
     batch, in_ch, _, _ = x_padded.shape
     out_ch, _, kH, kW = W.shape
 
@@ -298,12 +279,14 @@ def _conv2d_forward_kernel(x_padded, W, stride_h, stride_w, H_out, W_out):
     s = x_padded.strides
     col_shape = (batch, in_ch, kH, kW, H_out, W_out)
     col_strides = (s[0], s[1], s[2], s[3], stride_h * s[2], stride_w * s[3])
-    cols = xp.lib.stride_tricks.as_strided(
+    cols = backend.lib.stride_tricks.as_strided(
         x_padded, shape=col_shape, strides=col_strides
     )
-    cols_2d = xp.ascontiguousarray(cols).reshape(batch, in_ch * kH * kW, H_out * W_out)
+    cols_2d = backend.ascontiguousarray(cols).reshape(
+        batch, in_ch * kH * kW, H_out * W_out
+    )
     W_2d = W.reshape(out_ch, in_ch * kH * kW)
-    return xp.matmul(W_2d, cols_2d).reshape(batch, out_ch, H_out, W_out)
+    return backend.matmul(W_2d, cols_2d).reshape(batch, out_ch, H_out, W_out)
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +298,7 @@ def _conv2d_forward_kernel(x_padded, W, stride_h, stride_w, H_out, W_out):
 
 def _reshape(a, newshape):
     """Backend-agnostic reshape — stays on whichever device *a* lives on."""
-    return get_xp(a).reshape(a, newshape)
+    return backend.reshape(a, newshape)
 
 
 # ---------------------------------------------------------------------------
@@ -325,14 +308,12 @@ def _reshape(a, newshape):
 
 def _concatenate(*arrays, axis=0):
     """Variadic wrapper: ``_concatenate(a, b, c, axis=0)`` → backend concatenate."""
-    xp = get_xp(arrays[0])
-    return xp.concatenate(arrays, axis=axis)
+    return backend.concatenate(arrays, axis=axis)
 
 
 def _stack(*arrays, axis=0):
     """Variadic wrapper: ``_stack(a, b, c, axis=0)`` → backend stack."""
-    xp = get_xp(arrays[0])
-    return xp.stack(arrays, axis=axis)
+    return backend.stack(arrays, axis=axis)
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +361,6 @@ def _max_pool2d_backward(g, x, kernel_size, stride=1, padding=0):
 
     Works identically on NumPy (CPU) and CuPy (GPU); no data transfer.
     """
-    xp = get_xp(x)
     kernel_size = _norm_pair(kernel_size)
     stride = _norm_pair(stride)
     padding = _norm_int(padding)
@@ -388,7 +368,7 @@ def _max_pool2d_backward(g, x, kernel_size, stride=1, padding=0):
     sH, sW = stride
 
     if padding > 0:
-        x = xp.pad(x, ((0, 0), (0, 0), (padding, padding), (padding, padding)))
+        x = backend.pad(x, ((0, 0), (0, 0), (padding, padding), (padding, padding)))
 
     batch, channels, H_pad, W_pad = x.shape
     H_out = (H_pad - kH) // sH + 1
@@ -398,12 +378,14 @@ def _max_pool2d_backward(g, x, kernel_size, stride=1, padding=0):
     s = x.strides
     win_shape = (batch, channels, H_out, W_out, kH, kW)
     win_strides = (s[0], s[1], sH * s[2], sW * s[3], s[2], s[3])
-    x_win = xp.lib.stride_tricks.as_strided(x, shape=win_shape, strides=win_strides)
+    x_win = backend.lib.stride_tricks.as_strided(
+        x, shape=win_shape, strides=win_strides
+    )
 
     # ---- argmax (flat within kH*kW window) ---------------------------------
     # reshape to (B, C, H_out, W_out, kH*kW) for argmax
     x_flat = x_win.reshape(batch, channels, H_out, W_out, kH * kW)
-    flat_idx = xp.argmax(x_flat, axis=4)  # (B, C, H_out, W_out)
+    flat_idx = backend.argmax(x_flat, axis=4)  # (B, C, H_out, W_out)
 
     # ---- convert flat_idx → (kh_idx, kw_idx) -------------------------------
     kh_idx = flat_idx // kW  # (B, C, H_out, W_out)
@@ -411,20 +393,20 @@ def _max_pool2d_backward(g, x, kernel_size, stride=1, padding=0):
 
     # ---- absolute (h, w) position in padded input --------------------------
     # h_out_idx, w_out_idx: broadcast shapes (1, 1, H_out, 1) etc.
-    h_out_idx = xp.arange(H_out, dtype=xp.int64).reshape(1, 1, H_out, 1)
-    w_out_idx = xp.arange(W_out, dtype=xp.int64).reshape(1, 1, 1, W_out)
+    h_out_idx = backend.arange(H_out, dtype=backend.int64).reshape(1, 1, H_out, 1)
+    w_out_idx = backend.arange(W_out, dtype=backend.int64).reshape(1, 1, 1, W_out)
 
     abs_h = h_out_idx * sH + kh_idx  # (B, C, H_out, W_out)
     abs_w = w_out_idx * sW + kw_idx
 
     # ---- batch & channel index grids (for advanced indexing) ---------------
-    b_idx = xp.arange(batch, dtype=xp.int64).reshape(batch, 1, 1, 1)
-    c_idx = xp.arange(channels, dtype=xp.int64).reshape(1, channels, 1, 1)
+    b_idx = backend.arange(batch, dtype=backend.int64).reshape(batch, 1, 1, 1)
+    c_idx = backend.arange(channels, dtype=backend.int64).reshape(1, channels, 1, 1)
 
     # ---- scatter-add in one vectorized call --------------------------------
-    grad_x = xp.zeros_like(x)
-    # xp.add.at works on both numpy and cupy
-    xp.add.at(grad_x, (b_idx, c_idx, abs_h, abs_w), g)
+    grad_x = backend.zeros_like(x)
+    # backend.add.at works on both numpy and cupy
+    backend.add.at(grad_x, (b_idx, c_idx, abs_h, abs_w), g)
 
     if padding > 0:
         grad_x = grad_x[:, :, padding:-padding, padding:-padding]
@@ -443,7 +425,6 @@ def _avg_pool2d_backward(g, x, kernel_size, stride=1, padding=0):
 
     Works identically on NumPy (CPU) and CuPy (GPU); no data transfer.
     """
-    xp = get_xp(x)
     kernel_size = _norm_pair(kernel_size)
     stride = _norm_pair(stride)
     padding = _norm_int(padding)
@@ -460,13 +441,13 @@ def _avg_pool2d_backward(g, x, kernel_size, stride=1, padding=0):
 
     # ---- absolute h/w positions for every (output pos, kernel offset) ------
     # kh_off, kw_off: kernel offsets (kH, 1) and (1, kW)
-    kh_off = xp.arange(kH, dtype=xp.int64).reshape(kH, 1)
-    kw_off = xp.arange(kW, dtype=xp.int64).reshape(1, kW)
+    kh_off = backend.arange(kH, dtype=backend.int64).reshape(kH, 1)
+    kw_off = backend.arange(kW, dtype=backend.int64).reshape(1, kW)
 
     # h_base, w_base: output-position-based start of each window
     # shapes: (H_out, 1) and (1, W_out)
-    h_base = xp.arange(H_out, dtype=xp.int64).reshape(H_out, 1) * sH
-    w_base = xp.arange(W_out, dtype=xp.int64).reshape(1, W_out) * sW
+    h_base = backend.arange(H_out, dtype=backend.int64).reshape(H_out, 1) * sH
+    w_base = backend.arange(W_out, dtype=backend.int64).reshape(1, W_out) * sW
 
     # abs_h: (H_out, kH)  abs_w: (W_out, kW)
     abs_h = (h_base + kh_off.T).T  # broadcast (H_out,1)+(kH,1)→(kH,H_out) → T
@@ -476,16 +457,16 @@ def _avg_pool2d_backward(g, x, kernel_size, stride=1, padding=0):
     # We loop over kH*kW — but that's a Python-level loop over *kernel offsets*
     # (typically 9 iters for 3×3), and every iter is a fully vectorized
     # (B, C, H_out, W_out) scatter.  Total Python iters = kH*kW, not B*C*spatial.
-    grad_x = xp.zeros((batch, channels, H_padded, W_padded), dtype=g.dtype)
-    b_idx = xp.arange(batch, dtype=xp.int64).reshape(batch, 1, 1, 1)
-    c_idx = xp.arange(channels, dtype=xp.int64).reshape(1, channels, 1, 1)
+    grad_x = backend.zeros((batch, channels, H_padded, W_padded), dtype=g.dtype)
+    b_idx = backend.arange(batch, dtype=backend.int64).reshape(batch, 1, 1, 1)
+    c_idx = backend.arange(channels, dtype=backend.int64).reshape(1, channels, 1, 1)
 
     for kh in range(kH):
         for kw in range(kW):
-            h_pos = xp.arange(H_out, dtype=xp.int64) * sH + kh  # (H_out,)
-            w_pos = xp.arange(W_out, dtype=xp.int64) * sW + kw  # (W_out,)
+            h_pos = backend.arange(H_out, dtype=backend.int64) * sH + kh  # (H_out,)
+            w_pos = backend.arange(W_out, dtype=backend.int64) * sW + kw  # (W_out,)
             # Broadcast h_pos→(1,1,H_out,1), w_pos→(1,1,1,W_out)
-            xp.add.at(
+            backend.add.at(
                 grad_x,
                 (
                     b_idx,
@@ -502,8 +483,7 @@ def _avg_pool2d_backward(g, x, kernel_size, stride=1, padding=0):
 
 
 def _batch_norm_backward(g, x, weight, bias, mean, var, eps=1e-5):
-    xp = get_xp(x)
-    x_norm = (x - mean) / xp.sqrt(var + eps)
+    x_norm = (x - mean) / backend.sqrt(var + eps)
     grad_x_norm = g * weight
 
     # Determine reduction axes: BatchNorm2d → (0,2,3); BatchNorm1d → (0,)
@@ -514,14 +494,14 @@ def _batch_norm_backward(g, x, weight, bias, mean, var, eps=1e-5):
         norm_axes = (0,)
         N = x.shape[0]
 
-    std = xp.sqrt(var + eps)
+    std = backend.sqrt(var + eps)
     grad_x = (
         (1.0 / N)
         * (1.0 / std)
         * (
             N * grad_x_norm
-            - xp.sum(grad_x_norm, axis=norm_axes, keepdims=True)
-            - x_norm * xp.sum(grad_x_norm * x_norm, axis=norm_axes, keepdims=True)
+            - backend.sum(grad_x_norm, axis=norm_axes, keepdims=True)
+            - x_norm * backend.sum(grad_x_norm * x_norm, axis=norm_axes, keepdims=True)
         )
     )
     grad_weight = unbroadcast(g * x_norm, weight.shape)
@@ -552,22 +532,22 @@ def _py_cumsum(seq):
 # ---------------------------------------------------------------------------
 
 
-@vjp_rule(func=np.add)
+@vjp_rule(func=backend.add)
 def _vjp_add(g, x, y):
     return (unbroadcast(g, x.shape), unbroadcast(g, y.shape))
 
 
-@vjp_rule(func=np.subtract)
+@vjp_rule(func=backend.subtract)
 def _vjp_subtract(g, x, y):
     return (unbroadcast(g, x.shape), unbroadcast(-g, y.shape))
 
 
-@vjp_rule(func=np.multiply)
+@vjp_rule(func=backend.multiply)
 def _vjp_multiply(g, x, y):
     return (unbroadcast(g * y, x.shape), unbroadcast(g * x, y.shape))
 
 
-@vjp_rule(func=np.divide)
+@vjp_rule(func=backend.divide)
 def _vjp_divide(g, x, y):
     return (
         unbroadcast(g / y, x.shape),
@@ -575,21 +555,20 @@ def _vjp_divide(g, x, y):
     )
 
 
-@vjp_rule(func=np.power)
+@vjp_rule(func=backend.power)
 def _vjp_power(g, x, y):
-    xp = get_xp(x)
     return (
-        unbroadcast(g * y * xp.power(x, y - 1), x.shape),
-        unbroadcast(g * xp.power(x, y) * xp.log(x + safe_eps(x)), y.shape),
+        unbroadcast(g * y * backend.power(x, y - 1), x.shape),
+        unbroadcast(g * backend.power(x, y) * backend.log(x + safe_eps(x)), y.shape),
     )
 
 
-@vjp_rule(func=np.maximum)
+@vjp_rule(func=backend.maximum)
 def _vjp_maximum(g, x, y):
     return (unbroadcast(g * (x >= y), x.shape), unbroadcast(g * (x < y), y.shape))
 
 
-@vjp_rule(func=np.minimum)
+@vjp_rule(func=backend.minimum)
 def _vjp_minimum(g, x, y):
     return (unbroadcast(g * (x <= y), x.shape), unbroadcast(g * (x > y), y.shape))
 
@@ -599,49 +578,49 @@ def _vjp_minimum(g, x, y):
 # ---------------------------------------------------------------------------
 
 
-@vjp_rule(func=np.negative)
+@vjp_rule(func=backend.negative)
 def _vjp_negative(g, x):
     return (-g,)
 
 
-@vjp_rule(func=np.square)
+@vjp_rule(func=backend.square)
 def _vjp_square(g, x):
     return (g * 2 * x,)
 
 
-@vjp_rule(func=np.sqrt)
+@vjp_rule(func=backend.sqrt)
 def _vjp_sqrt(g, x):
-    return (g / (2 * get_xp(x).sqrt(x) + safe_eps(x)),)
+    return (g / (2 * backend.sqrt(x) + safe_eps(x)),)
 
 
-@vjp_rule(func=np.exp)
+@vjp_rule(func=backend.exp)
 def _vjp_exp(g, x):
-    return (g * get_xp(x).exp(x),)
+    return (g * backend.exp(x),)
 
 
-@vjp_rule(func=np.log)
+@vjp_rule(func=backend.log)
 def _vjp_log(g, x):
     return (g / (x + safe_eps(x)),)
 
 
-@vjp_rule(func=np.log1p)
+@vjp_rule(func=backend.log1p)
 def _vjp_log1p(g, x):
     return (g / (x + 1.0 + safe_eps(x)),)
 
 
-@vjp_rule(func=np.expm1)
+@vjp_rule(func=backend.expm1)
 def _vjp_expm1(g, x):
-    return (g * get_xp(x).exp(x),)
+    return (g * backend.exp(x),)
 
 
-@vjp_rule(func=np.abs)
+@vjp_rule(func=backend.abs)
 def _vjp_abs(g, x):
-    return (g * get_xp(x).sign(x),)
+    return (g * backend.sign(x),)
 
 
-@vjp_rule(func=np.sign)
+@vjp_rule(func=backend.sign)
 def _vjp_sign(g, x):
-    return (get_xp(x).zeros_like(x),)
+    return (backend.zeros_like(x),)
 
 
 # ---------------------------------------------------------------------------
@@ -649,34 +628,49 @@ def _vjp_sign(g, x):
 # ---------------------------------------------------------------------------
 
 
-@vjp_rule(func=np.sin)
+@vjp_rule(func=backend.sin)
 def _vjp_sin(g, x):
-    return (g * get_xp(x).cos(x),)
+    return (g * backend.cos(x),)
 
 
-@vjp_rule(func=np.cos)
+@vjp_rule(func=backend.cos)
 def _vjp_cos(g, x):
-    return (g * -get_xp(x).sin(x),)
+    return (g * -backend.sin(x),)
 
 
-@vjp_rule(func=np.tan)
+@vjp_rule(func=backend.tan)
 def _vjp_tan(g, x):
-    return (g / (get_xp(x).cos(x) ** 2 + safe_eps(x)),)
+    return (g / (backend.cos(x) ** 2 + safe_eps(x)),)
 
 
-@vjp_rule(func=np.sinh)
+@vjp_rule(func=backend.sinh)
 def _vjp_sinh(g, x):
-    return (g * get_xp(x).cosh(x),)
+    return (g * backend.cosh(x),)
 
 
-@vjp_rule(func=np.cosh)
+@vjp_rule(func=backend.cosh)
 def _vjp_cosh(g, x):
-    return (g * get_xp(x).sinh(x),)
+    return (g * backend.sinh(x),)
 
 
-@vjp_rule(func=np.tanh)
+@vjp_rule(func=backend.tanh)
 def _vjp_tanh(g, x):
-    return (g * (1 - get_xp(x).tanh(x) ** 2),)
+    return (g * (1 - backend.tanh(x) ** 2),)
+
+
+# ---------------------------------------------------------------------------
+# Special / Custom Ops
+# ---------------------------------------------------------------------------
+
+
+@vjp_rule(func=backend.where)
+def _vjp_where(g, condition, x, y):
+    zeros = backend.zeros_like(g)
+    return (
+        None,
+        backend.where(condition, g, zeros),
+        backend.where(condition, zeros, g),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -684,19 +678,19 @@ def _vjp_tanh(g, x):
 # ---------------------------------------------------------------------------
 
 
-@vjp_rule(func=np.floor)
+@vjp_rule(func=backend.floor)
 def _vjp_floor(g, x):
-    return (get_xp(x).zeros_like(x),)
+    return (backend.zeros_like(x),)
 
 
-@vjp_rule(func=np.ceil)
+@vjp_rule(func=backend.ceil)
 def _vjp_ceil(g, x):
-    return (get_xp(x).zeros_like(x),)
+    return (backend.zeros_like(x),)
 
 
-@vjp_rule(func=np.round)
+@vjp_rule(func=backend.round)
 def _vjp_round(g, x):
-    return (get_xp(x).zeros_like(x),)
+    return (backend.zeros_like(x),)
 
 
 # ---------------------------------------------------------------------------
@@ -704,25 +698,27 @@ def _vjp_round(g, x):
 # ---------------------------------------------------------------------------
 
 
-@vjp_rule(func=np.matmul)
+@vjp_rule(func=backend.matmul)
 def _vjp_matmul(g, x, y):
-    xp = get_xp(g)
     return (
         unbroadcast(
-            xp.matmul(g, xp.swapaxes(y, -1, -2) if getattr(y, "ndim", 0) >= 2 else y),
+            backend.matmul(
+                g, backend.swapaxes(y, -1, -2) if getattr(y, "ndim", 0) >= 2 else y
+            ),
             x.shape,
         ),
         unbroadcast(
-            xp.matmul(xp.swapaxes(x, -1, -2) if getattr(x, "ndim", 0) >= 2 else x, g),
+            backend.matmul(
+                backend.swapaxes(x, -1, -2) if getattr(x, "ndim", 0) >= 2 else x, g
+            ),
             y.shape,
         ),
     )
 
 
-@vjp_rule(func=np.dot)
+@vjp_rule(func=backend.dot)
 def _vjp_dot(g, x, y):
-    xp = get_xp(g)
-    return (xp.dot(g, y.T), xp.dot(x.T, g))
+    return (backend.dot(g, y.T), backend.dot(x.T, g))
 
 
 # ---------------------------------------------------------------------------
@@ -730,12 +726,12 @@ def _vjp_dot(g, x, y):
 # ---------------------------------------------------------------------------
 
 
-@vjp_rule(func=np.sum)
+@vjp_rule(func=backend.sum)
 def _vjp_sum(g, x, axis=None, keepdims=False):
     return (_restore_reduced_dims(g, x.shape, axis, keepdims),)
 
 
-@vjp_rule(func=np.mean)
+@vjp_rule(func=backend.mean)
 def _vjp_mean(g, x, axis=None, keepdims=False):
     # x.shape[a] are pure Python ints — compute n entirely in Python,
     # avoiding a GPU alloc + sync just to multiply a few scalars.
@@ -749,30 +745,27 @@ def _vjp_mean(g, x, axis=None, keepdims=False):
     return (_restore_reduced_dims(g, x.shape, axis, keepdims) / n,)
 
 
-@vjp_rule(func=np.prod)
+@vjp_rule(func=backend.prod)
 def _vjp_prod(g, x, axis=None, keepdims=False):
-    xp = get_xp(x)
     return (
         _restore_reduced_dims(g, x.shape, axis, keepdims)
-        * (xp.prod(x, axis=axis, keepdims=True) / (x + safe_eps(x))),
+        * (backend.prod(x, axis=axis, keepdims=True) / (x + safe_eps(x))),
     )
 
 
-@vjp_rule(func=np.max)
+@vjp_rule(func=backend.max)
 def _vjp_max(g, x, axis=None, keepdims=False):
-    xp = get_xp(x)
     return (
         _restore_reduced_dims(g, x.shape, axis, keepdims)
-        * (x == xp.max(x, axis=axis, keepdims=True)).astype(g.dtype),
+        * (x == backend.max(x, axis=axis, keepdims=True)).astype(g.dtype),
     )
 
 
-@vjp_rule(func=np.min)
+@vjp_rule(func=backend.min)
 def _vjp_min(g, x, axis=None, keepdims=False):
-    xp = get_xp(x)
     return (
         _restore_reduced_dims(g, x.shape, axis, keepdims)
-        * (x == xp.min(x, axis=axis, keepdims=True)).astype(g.dtype),
+        * (x == backend.min(x, axis=axis, keepdims=True)).astype(g.dtype),
     )
 
 
@@ -781,36 +774,35 @@ def _vjp_min(g, x, axis=None, keepdims=False):
 # ---------------------------------------------------------------------------
 
 
-@vjp_rule(func=np.transpose)
+@vjp_rule(func=backend.transpose)
 def _vjp_transpose(g, x, axes=None):
-    xp = get_xp(g)
-    # np.argsort is used intentionally — axes is always a tiny Python list/tuple,
+    # backend.argsort is used intentionally — axes is always a tiny Python list/tuple,
     # and cp.argsort(tuple) fails on some CuPy versions.  The result is passed
     # back as a plain list so both NumPy and CuPy accept it for transpose.
     return (
-        xp.transpose(g, np.argsort(list(axes)).tolist()) if axes is not None else g.T,
+        backend.transpose(g, backend.argsort(list(axes)).tolist())
+        if axes is not None
+        else g.T,
     )
 
 
-@vjp_rule(func=np.expand_dims)
+@vjp_rule(func=backend.expand_dims)
 def _vjp_expand_dims(g, x, axis):
-    return (get_xp(g).squeeze(g, axis),)
+    return (backend.squeeze(g, axis),)
 
 
-@vjp_rule(func=np.squeeze)
+@vjp_rule(func=backend.squeeze)
 def _vjp_squeeze(g, x, axis=None):
-    xp = get_xp(g)
-    return (xp.expand_dims(g, axis) if axis is not None else xp.reshape(g, x.shape),)
+    return (
+        backend.expand_dims(g, axis)
+        if axis is not None
+        else backend.reshape(g, x.shape),
+    )
 
 
 @vjp_rule(func=_reshape)
 def _vjp_reshape(g, x, newshape):
-    return (get_xp(g).reshape(g, x.shape),)
-
-
-# Keep np.reshape as an alias so any code that looks up VJP_RULES[np.reshape]
-# directly (e.g. legacy callers) still works.
-VJP_RULES[np.reshape] = _vjp_reshape
+    return (backend.reshape(g, x.shape),)
 
 
 # ---------------------------------------------------------------------------
@@ -831,14 +823,12 @@ def _vjp_relu(g, x):
 
 @vjp_rule(func=leaky_relu)
 def _vjp_leaky_relu(g, x):
-    xp = get_xp(x)
-    return (g * xp.where(x > 0, 1.0, 0.01),)
+    return (g * backend.where(x > 0, 1.0, 0.01),)
 
 
 @vjp_rule(func=elu)
 def _vjp_elu(g, x):
-    xp = get_xp(x)
-    return (g * xp.where(x > 0, 1.0, 1.0 * xp.exp(x)),)
+    return (g * backend.where(x > 0, 1.0, 1.0 * backend.exp(x)),)
 
 
 @vjp_rule(func=softplus)
@@ -855,18 +845,16 @@ def _vjp_swish(g, x):
 
 @vjp_rule(func=gelu)
 def _vjp_gelu(g, x):
-    xp = get_xp(x)
     inner = _GELU_COEFF * (x + 0.044715 * x**3)
-    t = xp.tanh(inner)  # computed once, reused three times
+    t = backend.tanh(inner)  # computed once, reused three times
     dcdf = _GELU_COEFF * (1.0 + 3.0 * 0.044715 * x**2)
     return (g * (0.5 * (1.0 + t) + 0.5 * x * (1.0 - t**2) * dcdf),)
 
 
 @vjp_rule(func=softmax)
 def _vjp_softmax(g, x):
-    xp = get_xp(x)
     s = softmax(x)  # computed once, reused twice
-    return (s * (g - xp.sum(g * s, axis=-1, keepdims=True)),)
+    return (s * (g - backend.sum(g * s, axis=-1, keepdims=True)),)
 
 
 # ---------------------------------------------------------------------------
@@ -885,9 +873,9 @@ def _vjp_conv2d(g, x, w, mode="valid"):
         conv2d(
             x
             if mode == "valid"
-            else get_xp(x).pad(x, [(w.shape[0] // 2,) * 2, (w.shape[1] // 2,) * 2])
+            else backend.pad(x, [(w.shape[0] // 2,) * 2, (w.shape[1] // 2,) * 2])
             if mode == "same"
-            else get_xp(x).pad(x, [(w.shape[0] - 1,) * 2, (w.shape[1] - 1,) * 2]),
+            else backend.pad(x, [(w.shape[0] - 1,) * 2, (w.shape[1] - 1,) * 2]),
             g,
             mode="valid",
         ),
@@ -913,55 +901,58 @@ def _vjp_conv2d_forward_kernel(
     dx  : same shape as x_unpad
     dW  : same shape as W
     """
-    xp = get_xp(g)
     batch = x_unpad.shape[0]
     out_ch, in_ch, kH, kW = W.shape
 
     if pad_h > 0 or pad_w > 0:
-        x_padded = xp.pad(x_unpad, ((0, 0), (0, 0), (pad_h, pad_h), (pad_w, pad_w)))
+        x_padded = backend.pad(
+            x_unpad, ((0, 0), (0, 0), (pad_h, pad_h), (pad_w, pad_w))
+        )
     else:
         x_padded = x_unpad
 
     s = x_padded.strides
     col_shape = (batch, in_ch, kH, kW, H_out, W_out)
     col_strides = (s[0], s[1], s[2], s[3], stride_h * s[2], stride_w * s[3])
-    cols = xp.lib.stride_tricks.as_strided(
+    cols = backend.lib.stride_tricks.as_strided(
         x_padded, shape=col_shape, strides=col_strides
     )
-    cols_2d = xp.ascontiguousarray(cols).reshape(batch, in_ch * kH * kW, H_out * W_out)
+    cols_2d = backend.ascontiguousarray(cols).reshape(
+        batch, in_ch * kH * kW, H_out * W_out
+    )
 
     g_2d = g.reshape(batch, out_ch, H_out * W_out)
     W_2d = W.reshape(out_ch, in_ch * kH * kW)
 
     # Gradient w.r.t. W: dW[c, k] = sum_{b,n} g[b,c,n] * cols[b,k,n]
-    dW_2d = xp.matmul(g_2d, cols_2d.transpose(0, 2, 1)).sum(axis=0)
+    dW_2d = backend.matmul(g_2d, cols_2d.transpose(0, 2, 1)).sum(axis=0)
     dW = dW_2d.reshape(W.shape)
 
     # Gradient w.r.t. cols via W^T @ g
-    dcols_2d = xp.matmul(W_2d.T[None], g_2d)  # (1,K,C_out) @ (B,C_out,N) → (B,K,N)
+    dcols_2d = backend.matmul(W_2d.T[None], g_2d)  # (1,K,C_out) @ (B,C_out,N) → (B,K,N)
     dcols = dcols_2d.reshape(batch, in_ch, kH, kW, H_out, W_out)
 
-    dx_padded = xp.zeros_like(x_padded)
+    dx_padded = backend.zeros_like(x_padded)
 
     # Vectorized col2im: scatter dcols into dx_padded in a single add.at call.
     # dcols shape: (batch, in_ch, kH, kW, H_out, W_out)
     # Each (b, c, dh, dw, ho, wo) maps to dx_padded[b, c, dh+ho*sH, dw+wo*sW].
     # Build broadcasted index arrays shaped (B,1,kH,1,H_out,1) etc. to match dcols.
-    kh_range = xp.arange(kH, dtype=xp.int64)  # (kH,)
-    kw_range = xp.arange(kW, dtype=xp.int64)  # (kW,)
-    ho_range = xp.arange(H_out, dtype=xp.int64)  # (H_out,)
-    wo_range = xp.arange(W_out, dtype=xp.int64)  # (W_out,)
+    kh_range = backend.arange(kH, dtype=backend.int64)  # (kH,)
+    kw_range = backend.arange(kW, dtype=backend.int64)  # (kW,)
+    ho_range = backend.arange(H_out, dtype=backend.int64)  # (H_out,)
+    wo_range = backend.arange(W_out, dtype=backend.int64)  # (W_out,)
 
     # abs positions: kh + ho*stride_h, kw + wo*stride_w
     abs_h = kh_range[:, None] + ho_range[None, :] * stride_h  # (kH, H_out)
     abs_w = kw_range[:, None] + wo_range[None, :] * stride_w  # (kW, W_out)
 
-    b_full = xp.arange(batch, dtype=xp.int64).reshape(batch, 1, 1, 1, 1, 1)
-    c_full = xp.arange(in_ch, dtype=xp.int64).reshape(1, in_ch, 1, 1, 1, 1)
+    b_full = backend.arange(batch, dtype=backend.int64).reshape(batch, 1, 1, 1, 1, 1)
+    c_full = backend.arange(in_ch, dtype=backend.int64).reshape(1, in_ch, 1, 1, 1, 1)
     h_full = abs_h.reshape(1, 1, kH, 1, H_out, 1)
     w_full = abs_w.reshape(1, 1, 1, kW, 1, W_out)
 
-    xp.add.at(dx_padded, (b_full, c_full, h_full, w_full), dcols)
+    backend.add.at(dx_padded, (b_full, c_full, h_full, w_full), dcols)
 
     if pad_h > 0 and pad_w > 0:
         dx = dx_padded[:, :, pad_h:-pad_h, pad_w:-pad_w]
@@ -973,6 +964,16 @@ def _vjp_conv2d_forward_kernel(
         dx = dx_padded
 
     return dx, dW
+
+
+@vjp_rule(func=conv2d_nd)
+def _vjp_conv2d_nd(g, x_unpad, W, stride_h=1, stride_w=1, pad_h=0, pad_w=0):
+    kH, kW = W.shape[2], W.shape[3]
+    H_out = (x_unpad.shape[2] + 2 * pad_h - kH) // stride_h + 1
+    W_out = (x_unpad.shape[3] + 2 * pad_w - kW) // stride_w + 1
+    return _vjp_conv2d_forward_kernel(
+        g, x_unpad, W, pad_h, pad_w, stride_h, stride_w, H_out, W_out
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1018,9 +1019,10 @@ def _vjp_batch_norm(g, x, weight, bias, mean, var, eps=1e-5):
 @vjp_rule(func=_concatenate)
 def _vjp_concatenate(g, *arrays, axis=0):
     """Reverse of concatenate: split upstream gradient at input boundaries."""
-    xp = get_xp(g)
-    split_indices = list(np.cumsum([a.shape[axis] for a in arrays[:-1]], dtype=int))
-    parts = xp.split(g, split_indices, axis=axis)
+    split_indices = list(
+        backend.cumsum([a.shape[axis] for a in arrays[:-1]], dtype=int)
+    )
+    parts = backend.split(g, split_indices, axis=axis)
     return tuple(parts)
 
 
@@ -1030,11 +1032,10 @@ def _vjp_stack(g, *arrays, axis=0):
     return tuple(g[(slice(None),) * axis + (i,)] for i in range(len(arrays)))
 
 
-@vjp_rule(func=np.clip)
+@vjp_rule(func=backend.clip)
 def _vjp_clip(g, x, a_min=None, a_max=None):
     """Gradient flows only where the input is inside (a_min, a_max)."""
-    xp = get_xp(x)
-    mask = xp.ones(x.shape, dtype=bool)
+    mask = backend.ones(x.shape, dtype=bool)
     if a_min is not None:
         mask = mask & (x >= a_min)
     if a_max is not None:
@@ -1042,34 +1043,34 @@ def _vjp_clip(g, x, a_min=None, a_max=None):
     return (g * mask.astype(g.dtype),)
 
 
-@vjp_rule(func=np.cumsum)
+@vjp_rule(func=backend.cumsum)
 def _vjp_cumsum(g, x, axis=None):
     """VJP of cumsum: reverse cumulative sum along the given axis."""
-    xp = get_xp(g)
     if axis is None:
         g_flat = g.reshape(-1)
-        return (xp.flip(xp.cumsum(xp.flip(g_flat, 0), 0), 0).reshape(x.shape),)
-    return (xp.flip(xp.cumsum(xp.flip(g, axis), axis), axis),)
+        return (
+            backend.flip(backend.cumsum(backend.flip(g_flat, 0), 0), 0).reshape(
+                x.shape
+            ),
+        )
+    return (backend.flip(backend.cumsum(backend.flip(g, axis), axis), axis),)
 
 
-@vjp_rule(func=np.flip)
+@vjp_rule(func=backend.flip)
 def _vjp_flip(g, x, axis=None):
     """VJP of flip: flip is its own inverse."""
-    xp = get_xp(g)
-    return (xp.flip(g, axis),)
+    return (backend.flip(g, axis),)
 
 
-@vjp_rule(func=np.roll)
+@vjp_rule(func=backend.roll)
 def _vjp_roll(g, x, shift, axis=None):
     """VJP of roll: un-roll by shifting in the opposite direction."""
-    xp = get_xp(g)
-    return (xp.roll(g, -shift, axis),)
+    return (backend.roll(g, -shift, axis),)
 
 
-@vjp_rule(func=np.tile)
+@vjp_rule(func=backend.tile)
 def _vjp_tile(g, x, reps):
     """VJP of tile: fold tiled copies back into x's shape and sum."""
-    xp = get_xp(g)
     # reps may arrive as a 0-d ndarray (from scalar wrapping in vpj) or int.
     if hasattr(reps, "ndim") and reps.ndim == 0:
         reps = (int(reps),)
@@ -1083,14 +1084,14 @@ def _vjp_tile(g, x, reps):
     interleaved = [s for pair in zip(reps_padded, x_shape) for s in pair]
     sum_axes = tuple(range(0, 2 * n, 2))
     return (
-        xp.ascontiguousarray(g)
+        backend.ascontiguousarray(g)
         .reshape(interleaved)
         .sum(axis=sum_axes)
         .reshape(x.shape),
     )
 
 
-@vjp_rule(func=np.repeat)
+@vjp_rule(func=backend.repeat)
 def _vjp_repeat(g, x, repeats, axis=None):
     """VJP of repeat: accumulate gradient from all repeated copies.
 
@@ -1099,7 +1100,6 @@ def _vjp_repeat(g, x, repeats, axis=None):
     We therefore use pure-Python cumsum to build split indices — no numpy/cupy
     allocation, no device sync.
     """
-    xp = get_xp(g)
     # Normalise repeats to a plain Python int or list[int] — no device arrays.
     if hasattr(repeats, "ndim") and repeats.ndim == 0:
         repeats = int(repeats)
@@ -1117,15 +1117,17 @@ def _vjp_repeat(g, x, repeats, axis=None):
             return (g_flat.reshape(-1, repeats).sum(axis=1).reshape(x.shape),)
         # Pure-Python prefix-sum for split points — zero device overhead.
         splits = _py_cumsum(repeats[:-1])
-        parts = xp.split(g_flat, splits)
-        return (xp.stack([p.sum() for p in parts]).astype(g.dtype).reshape(x.shape),)
+        parts = backend.split(g_flat, splits)
+        return (
+            backend.stack([p.sum() for p in parts]).astype(g.dtype).reshape(x.shape),
+        )
     if scalar_reps:
         g_shape = list(g.shape)
         new_shape = g_shape[:axis] + [x.shape[axis], repeats] + g_shape[axis + 1 :]
-        return (xp.ascontiguousarray(g).reshape(new_shape).sum(axis=axis + 1),)
+        return (backend.ascontiguousarray(g).reshape(new_shape).sum(axis=axis + 1),)
     splits = _py_cumsum(repeats[:-1])
-    parts = xp.split(g, splits, axis=axis)
-    return (xp.stack([p.sum(axis=axis) for p in parts], axis=axis),)
+    parts = backend.split(g, splits, axis=axis)
+    return (backend.stack([p.sum(axis=axis) for p in parts], axis=axis),)
 
 
 # ===========================================================================
@@ -1137,7 +1139,7 @@ def _vjp_repeat(g, x, repeats, axis=None):
 # * Every forward function returns a *scalar* (mean-reduced) loss unless noted.
 # * Every VJP is derived analytically from the closed-form definition —
 #   no approximations, no finite differences, no composition through ops.
-# * All ops are backend-agnostic: get_xp() dispatches to CuPy on GPU.
+# * All ops are backend-agnostic: backend.* dispatches to CuPy on GPU.
 # * Numerically stable implementations use log-sum-exp / fused log-sigmoid
 #   tricks wherever cancellation would occur in the naive formula.
 # * Shape contract: predictions first, targets second (matching PyTorch/Keras).
@@ -1151,23 +1153,18 @@ def _vjp_repeat(g, x, repeats, axis=None):
 # ---------------------------------------------------------------------------
 # 1. Mean Squared Error  —  MSE
 # ---------------------------------------------------------------------------
-#
-#   L = (1/N) * sum( (ŷ - y)^2 )
-#
-#   ∂L/∂ŷ_i = 2(ŷ_i - y_i) / N
-#   ∂L/∂y_i = -2(ŷ_i - y_i) / N
+
+# Note: For the mathematical VJP derivation, see the VJP_RULES*.md documentation.
 
 
 def mse_loss(y_pred, y_true):
     """Mean squared error: mean((ŷ - y)²)."""
-    xp = get_xp(y_pred)
     diff = y_pred - y_true
-    return xp.mean(diff * diff)
+    return backend.mean(diff * diff)
 
 
 @vjp_rule(func=mse_loss)
 def _vjp_mse_loss(g, y_pred, y_true):
-    xp = get_xp(y_pred)
     N = y_pred.size
     diff = y_pred - y_true
     # ∂L/∂ŷ = 2·diff/N,  ∂L/∂y = -2·diff/N
@@ -1178,129 +1175,97 @@ def _vjp_mse_loss(g, y_pred, y_true):
 # ---------------------------------------------------------------------------
 # 2. Mean Absolute Error  —  MAE / L1
 # ---------------------------------------------------------------------------
-#
-#   L = (1/N) * sum( |ŷ - y| )
-#
-#   ∂L/∂ŷ_i = sign(ŷ_i - y_i) / N
-#   ∂L/∂y_i = -sign(ŷ_i - y_i) / N
-#   Note: gradient is 0 exactly at ŷ=y (subgradient choice, consistent with
-#   PyTorch/TF behaviour).
+
+# Note: For the mathematical VJP derivation, see the VJP_RULES*.md documentation.
 
 
 def mae_loss(y_pred, y_true):
     """Mean absolute error: mean(|ŷ - y|)."""
-    xp = get_xp(y_pred)
-    return xp.mean(xp.abs(y_pred - y_true))
+    return backend.mean(backend.abs(y_pred - y_true))
 
 
 @vjp_rule(func=mae_loss)
 def _vjp_mae_loss(g, y_pred, y_true):
-    xp = get_xp(y_pred)
     N = y_pred.size
-    grad = g * xp.sign(y_pred - y_true) / N
+    grad = g * backend.sign(y_pred - y_true) / N
     return (grad, -grad)
 
 
 # ---------------------------------------------------------------------------
 # 3. Huber Loss  (Smooth L1)
 # ---------------------------------------------------------------------------
-#
-#   δ  = delta (default 1.0)
-#   r  = ŷ - y
-#
-#         { r²/2            if |r| ≤ δ
-#   L_i = {
-#         { δ(|r| - δ/2)   otherwise
-#
-#   L = mean(L_i)
-#
-#          { r / N          if |r| ≤ δ
-#   ∂L/∂ŷ =
-#          { δ·sign(r) / N  otherwise
+
+# Note: For the mathematical VJP derivation, see the VJP_RULES*.md documentation.
 
 
 def huber_loss(y_pred, y_true, delta=1.0):
     """Huber (smooth L1) loss."""
-    xp = get_xp(y_pred)
     r = y_pred - y_true
-    abs_r = xp.abs(r)
+    abs_r = backend.abs(r)
     quadratic = 0.5 * r * r
     linear = delta * (abs_r - 0.5 * delta)
-    return xp.mean(xp.where(abs_r <= delta, quadratic, linear))
+    return backend.mean(backend.where(abs_r <= delta, quadratic, linear))
 
 
 @vjp_rule(func=huber_loss)
 def _vjp_huber_loss(g, y_pred, y_true, delta=1.0):
-    xp = get_xp(y_pred)
     N = y_pred.size
     r = y_pred - y_true
-    abs_r = xp.abs(r)
+    abs_r = backend.abs(r)
     # Quadratic branch: ∂/∂ŷ = r/N
     # Linear  branch : ∂/∂ŷ = δ·sign(r)/N
-    grad = g * xp.where(abs_r <= delta, r, delta * xp.sign(r)) / N
+    grad = g * backend.where(abs_r <= delta, r, delta * backend.sign(r)) / N
     return (grad, -grad)
 
 
 # ---------------------------------------------------------------------------
 # 4. Log-Cosh Loss
 # ---------------------------------------------------------------------------
-#
-#   L = (1/N) * sum( log(cosh(ŷ - y)) )
-#
-#   d/dr log(cosh(r)) = sinh(r)/cosh(r) = tanh(r)
-#
-#   ∂L/∂ŷ_i = tanh(ŷ_i - y_i) / N
-#   ∂L/∂y_i = -tanh(ŷ_i - y_i) / N
-#
-#   Numerically stable: log(cosh(r)) = |r| + log(1 + exp(-2|r|)) - log(2)
-#   (avoids cosh overflow for large |r|).
+
+# Note: For the mathematical VJP derivation, see the VJP_RULES*.md documentation.
 
 
 def log_cosh_loss(y_pred, y_true):
     """Log-cosh loss: mean(log(cosh(ŷ - y)))."""
-    xp = get_xp(y_pred)
     r = y_pred - y_true
     # Stable: log cosh(r) = |r| + softplus(-2|r|) - log2
-    abs_r = xp.abs(r)
-    val = abs_r + xp.log1p(xp.exp(-2.0 * abs_r)) - xp.log(xp.array(2.0, dtype=r.dtype))
-    return xp.mean(val)
+    abs_r = backend.abs(r)
+    val = (
+        abs_r
+        + backend.log1p(backend.exp(-2.0 * abs_r))
+        - backend.log(backend.array(2.0, dtype=r.dtype))
+    )
+    return backend.mean(val)
 
 
 @vjp_rule(func=log_cosh_loss)
 def _vjp_log_cosh_loss(g, y_pred, y_true):
-    xp = get_xp(y_pred)
     N = y_pred.size
-    grad = g * xp.tanh(y_pred - y_true) / N
+    grad = g * backend.tanh(y_pred - y_true) / N
     return (grad, -grad)
 
 
 # ---------------------------------------------------------------------------
 # 5. Binary Cross-Entropy  (from probabilities)
 # ---------------------------------------------------------------------------
-#
-#   p ∈ (0,1) — sigmoid outputs, clamped away from 0/1
-#   y ∈ {0,1}
-#
-#   L = -(1/N) * sum( y·log(p) + (1-y)·log(1-p) )
-#
-#   ∂L/∂p_i = [ -y/p + (1-y)/(1-p) ] / N
-#            = (p - y) / [ p(1-p) · N ]
+
+# Note: For the mathematical VJP derivation, see the VJP_RULES*.md documentation.
 
 
 def bce_loss(y_pred, y_true):
     """Binary cross-entropy from probabilities ∈ (0,1)."""
-    xp = get_xp(y_pred)
     eps = safe_eps(y_pred)
-    p = xp.clip(y_pred, eps, 1.0 - eps)
-    return -xp.mean(y_true * xp.log(p) + (1.0 - y_true) * xp.log(1.0 - p))
+    p = backend.clip(y_pred, eps, 1.0 - eps)
+    return -backend.mean(
+        y_true * backend.log(p) + (1.0 - y_true) * backend.log(1.0 - p)
+    )
 
 
 @vjp_rule(func=bce_loss)
 def _vjp_bce_loss(g, y_pred, y_true):
-    xp = get_xp(y_pred)
     N = y_pred.size
     eps = safe_eps(y_pred)
-    p = xp.clip(y_pred, eps, 1.0 - eps)
+    p = backend.clip(y_pred, eps, 1.0 - eps)
     # (p - y) / (p·(1-p)·N)
     grad = g * (p - y_true) / (p * (1.0 - p) * N)
     return (grad, None)  # no gradient w.r.t. targets
@@ -1309,29 +1274,21 @@ def _vjp_bce_loss(g, y_pred, y_true):
 # ---------------------------------------------------------------------------
 # 6. Binary Cross-Entropy from Logits  (numerically stable)
 # ---------------------------------------------------------------------------
-#
-#   x = raw logit,  σ(x) = sigmoid(x),  y ∈ {0,1}
-#
-#   L = (1/N) * sum( max(x,0) - x·y + log(1 + exp(-|x|)) )
-#       [= (1/N)*sum( log(1+e^x) - x·y ), the log-sum-exp stable form]
-#
-#   ∂L/∂x_i = (σ(x_i) - y_i) / N
-#
-#   This is the single most important fused loss: gradient is exact and
-#   never suffers from sigmoid saturation cancellation.
+
+# Note: For the mathematical VJP derivation, see the VJP_RULES*.md documentation.
 
 
 def bce_with_logits_loss(logits, y_true):
     """Binary cross-entropy directly from logits (numerically stable)."""
-    xp = get_xp(logits)
     # max(x,0) - x*y + log(1+exp(-|x|))
-    relu_logits = xp.maximum(logits, 0.0)
-    return xp.mean(relu_logits - logits * y_true + xp.log1p(xp.exp(-xp.abs(logits))))
+    relu_logits = backend.maximum(logits, 0.0)
+    return backend.mean(
+        relu_logits - logits * y_true + backend.log1p(backend.exp(-backend.abs(logits)))
+    )
 
 
 @vjp_rule(func=bce_with_logits_loss)
 def _vjp_bce_with_logits_loss(g, logits, y_true):
-    xp = get_xp(logits)
     N = logits.size
     # Exact: sigmoid(x) - y, never NaN/inf regardless of logit magnitude
     grad = g * (sigmoid(logits) - y_true) / N
@@ -1341,29 +1298,22 @@ def _vjp_bce_with_logits_loss(g, logits, y_true):
 # ---------------------------------------------------------------------------
 # 7. Categorical Cross-Entropy  (from probability vectors)
 # ---------------------------------------------------------------------------
-#
-#   p : (N, C) — softmax outputs, rows sum to 1
-#   y : (N, C) — one-hot targets
-#
-#   L = -(1/N) * sum_n sum_c  y_{n,c} · log(p_{n,c})
-#
-#   ∂L/∂p_{n,c} = -y_{n,c} / (p_{n,c} · N)
+
+# Note: For the mathematical VJP derivation, see the VJP_RULES*.md documentation.
 
 
 def cce_loss(y_pred, y_true):
     """Categorical cross-entropy from probability vectors."""
-    xp = get_xp(y_pred)
     eps = safe_eps(y_pred)
-    p = xp.clip(y_pred, eps, 1.0)
-    return -xp.mean(xp.sum(y_true * xp.log(p), axis=-1))
+    p = backend.clip(y_pred, eps, 1.0)
+    return -backend.mean(backend.sum(y_true * backend.log(p), axis=-1))
 
 
 @vjp_rule(func=cce_loss)
 def _vjp_cce_loss(g, y_pred, y_true):
-    xp = get_xp(y_pred)
     N = y_pred.shape[0]  # batch size (mean over samples, sum over classes)
     eps = safe_eps(y_pred)
-    p = xp.clip(y_pred, eps, 1.0)
+    p = backend.clip(y_pred, eps, 1.0)
     grad = g * (-y_true / (p * N))
     return (grad, None)
 
@@ -1371,37 +1321,27 @@ def _vjp_cce_loss(g, y_pred, y_true):
 # ---------------------------------------------------------------------------
 # 8. Categorical Cross-Entropy from Logits  (log-softmax, numerically stable)
 # ---------------------------------------------------------------------------
-#
-#   x : (N, C) — raw logits
-#   y : (N, C) — one-hot targets
-#
-#   log_softmax(x)_c = x_c - log(sum_k exp(x_k))   [stable via max-shift]
-#   L = -(1/N) * sum_n sum_c  y_{n,c} · log_softmax(x_{n,c})
-#
-#   ∂L/∂x_{n,c} = ( softmax(x_{n,c}) - y_{n,c} ) / N
-#
-#   This is the canonical softmax-CE gradient; no intermediate probability
-#   tensor is ever materialised for the backward, only softmax(x).
+
+# Note: For the mathematical VJP derivation, see the VJP_RULES*.md documentation.
 
 
 def _log_softmax(x, axis=-1):
     """Numerically stable log-softmax."""
-    xp = get_xp(x)
-    x_max = xp.max(x, axis=axis, keepdims=True)
+    x_max = backend.max(x, axis=axis, keepdims=True)
     shifted = x - x_max
-    return shifted - xp.log(xp.sum(xp.exp(shifted), axis=axis, keepdims=True))
+    return shifted - backend.log(
+        backend.sum(backend.exp(shifted), axis=axis, keepdims=True)
+    )
 
 
 def cce_with_logits_loss(logits, y_true):
     """Categorical cross-entropy directly from logits (log-softmax stable)."""
-    xp = get_xp(logits)
     log_p = _log_softmax(logits, axis=-1)
-    return -xp.mean(xp.sum(y_true * log_p, axis=-1))
+    return -backend.mean(backend.sum(y_true * log_p, axis=-1))
 
 
 @vjp_rule(func=cce_with_logits_loss)
 def _vjp_cce_with_logits_loss(g, logits, y_true):
-    xp = get_xp(logits)
     N = logits.shape[0]
     # Exact: (softmax(x) - y) / N
     grad = g * (softmax(logits, axis=-1) - y_true) / N
@@ -1411,98 +1351,81 @@ def _vjp_cce_with_logits_loss(g, logits, y_true):
 # ---------------------------------------------------------------------------
 # 9. Sparse Categorical Cross-Entropy from Logits
 # ---------------------------------------------------------------------------
-#
-#   logits : (N, C)
-#   y_true : (N,)  — integer class indices in [0, C)
-#
-#   Forward: identical to cce_with_logits_loss after converting y to one-hot.
-#   Backward: (softmax(x) - one_hot(y)) / N
-#
-#   one_hot is materialised lazily with advanced indexing — no dense alloc
-#   beyond the (N,C) softmax output already needed for the gradient.
+
+# Note: For the mathematical VJP derivation, see the VJP_RULES*.md documentation.
 
 
 def sparse_cce_with_logits_loss(logits, y_true):
     """Sparse categorical cross-entropy from logits (integer targets)."""
-    xp = get_xp(logits)
     log_p = _log_softmax(logits, axis=-1)
     N = logits.shape[0]
     # Gather log_p at the true class for each sample: log_p[n, y_true[n]]
-    idx = (xp.arange(N, dtype=xp.int64), y_true.astype(xp.int64))
-    return -xp.mean(log_p[idx])
+    idx = (backend.arange(N, dtype=backend.int64), y_true.astype(backend.int64))
+    return -backend.mean(log_p[idx])
 
 
 @vjp_rule(func=sparse_cce_with_logits_loss)
 def _vjp_sparse_cce_with_logits_loss(g, logits, y_true):
-    xp = get_xp(logits)
     N, C = logits.shape
     s = softmax(logits, axis=-1).copy()  # (N, C) — contiguous for scatter
     # Subtract 1 at the true-class position: equivalent to (s - one_hot(y))
-    xp.add.at(s, (xp.arange(N, dtype=xp.int64), y_true.astype(xp.int64)), -1.0)
+    backend.add.at(
+        s, (backend.arange(N, dtype=backend.int64), y_true.astype(backend.int64)), -1.0
+    )
     return (g * s / N, None)
 
 
 # ---------------------------------------------------------------------------
 # 10. Negative Log-Likelihood Loss  (NLL)
 # ---------------------------------------------------------------------------
-#
-#   log_probs : (N, C) — log-probabilities (output of log-softmax)
-#   y_true    : (N,)   — integer class indices
-#
-#   L = -(1/N) * sum_n  log_probs[n, y_true[n]]
-#
-#   ∂L/∂log_probs[n,c] = -𝟙[c == y_true[n]] / N
-#   (zero everywhere except the true-class column of each sample)
+
+# Note: For the mathematical VJP derivation, see the VJP_RULES*.md documentation.
 
 
 def nll_loss(log_probs, y_true):
     """Negative log-likelihood: -mean(log_probs[n, y[n]])."""
-    xp = get_xp(log_probs)
     N = log_probs.shape[0]
-    idx = (xp.arange(N, dtype=xp.int64), y_true.astype(xp.int64))
-    return -xp.mean(log_probs[idx])
+    idx = (backend.arange(N, dtype=backend.int64), y_true.astype(backend.int64))
+    return -backend.mean(log_probs[idx])
 
 
 @vjp_rule(func=nll_loss)
 def _vjp_nll_loss(g, log_probs, y_true):
-    xp = get_xp(log_probs)
     N = log_probs.shape[0]
-    grad = xp.zeros_like(log_probs)
+    grad = backend.zeros_like(log_probs)
     # Scatter -1/N into the true-class positions
-    xp.add.at(grad, (xp.arange(N, dtype=xp.int64), y_true.astype(xp.int64)), -1.0 / N)
+    backend.add.at(
+        grad,
+        (backend.arange(N, dtype=backend.int64), y_true.astype(backend.int64)),
+        -1.0 / N,
+    )
     return (g * grad, None)
 
 
 # ---------------------------------------------------------------------------
 # 11. KL Divergence  KL(P ‖ Q)
 # ---------------------------------------------------------------------------
-#
-#   p, q : (N, C) — probability distributions (rows sum to 1)
-#
-#   L = (1/N) * sum_n sum_c  p_{n,c} · log(p_{n,c} / q_{n,c})
-#     = (1/N) * sum( p * (log p - log q) )
-#
-#   ∂L/∂p_{n,c} = ( log(p/q) + 1 ) / N
-#   ∂L/∂q_{n,c} = -p_{n,c} / (q_{n,c} · N)
+
+# Note: For the mathematical VJP derivation, see the VJP_RULES*.md documentation.
 
 
 def kl_divergence_loss(p, q):
     """KL divergence KL(p ‖ q) = mean(sum(p · log(p/q), axis=-1))."""
-    xp = get_xp(p)
     eps = safe_eps(p)
-    p_safe = xp.clip(p, eps, 1.0)
-    q_safe = xp.clip(q, eps, 1.0)
-    return xp.mean(xp.sum(p_safe * (xp.log(p_safe) - xp.log(q_safe)), axis=-1))
+    p_safe = backend.clip(p, eps, 1.0)
+    q_safe = backend.clip(q, eps, 1.0)
+    return backend.mean(
+        backend.sum(p_safe * (backend.log(p_safe) - backend.log(q_safe)), axis=-1)
+    )
 
 
 @vjp_rule(func=kl_divergence_loss)
 def _vjp_kl_divergence_loss(g, p, q):
-    xp = get_xp(p)
     N = p.shape[0]
     eps = safe_eps(p)
-    p_safe = xp.clip(p, eps, 1.0)
-    q_safe = xp.clip(q, eps, 1.0)
-    grad_p = g * (xp.log(p_safe) - xp.log(q_safe) + 1.0) / N
+    p_safe = backend.clip(p, eps, 1.0)
+    q_safe = backend.clip(q, eps, 1.0)
+    grad_p = g * (backend.log(p_safe) - backend.log(q_safe) + 1.0) / N
     grad_q = g * (-p_safe / (q_safe * N))
     return (grad_p, grad_q)
 
@@ -1510,48 +1433,35 @@ def _vjp_kl_divergence_loss(g, p, q):
 # ---------------------------------------------------------------------------
 # 12. Focal Loss  (binary, from logits)
 # ---------------------------------------------------------------------------
-#
-#   x  = logit,  p = sigmoid(x),  y ∈ {0,1},  γ ≥ 0,  α ∈ [0,1]
-#
-#   pt   = p  if y=1  else  1-p
-#   FL_i = -α_t · (1 - pt)^γ · log(pt)
-#   L    = mean(FL_i)
-#
-#   Exact gradient via product rule + chain rule (no approximation):
-#
-#   ∂FL/∂x = -(1-pt)^γ · [ γ·pt·log(pt)/(1-pt) + 1 ] · ∂log(pt)/∂x · α_t / N
-#
-#   Simplified closed form (consistent with the Facebook/torchvision derivation):
-#
-#   ∂L/∂x_i = α_t · (1-pt)^(γ-1) · [ γ·pt·log(pt) - (1-pt) ] · ∂pt/∂x_i / N
-#            where ∂pt/∂x = σ(x)·(1-σ(x)) for y=1, -σ(x)·(1-σ(x)) for y=0
+
+# Note: For the mathematical VJP derivation, see the VJP_RULES*.md documentation.
 
 
 def focal_loss(logits, y_true, gamma=2.0, alpha=0.25):
     """Binary focal loss from logits (Lin et al. 2017)."""
-    xp = get_xp(logits)
     p = sigmoid(logits)
     # pt: probability of the *true* class
-    pt = xp.where(y_true == 1, p, 1.0 - p)
-    alpha_t = xp.where(y_true == 1, alpha, 1.0 - alpha)
+    pt = backend.where(y_true == 1, p, 1.0 - p)
+    alpha_t = backend.where(y_true == 1, alpha, 1.0 - alpha)
     # Stable log(pt): use log-sigmoid trick
-    log_pt = xp.where(
+    log_pt = backend.where(
         y_true == 1,
-        -xp.log1p(xp.exp(-xp.abs(logits))) - xp.maximum(-logits, 0.0),
-        -xp.log1p(xp.exp(-xp.abs(logits))) - xp.maximum(logits, 0.0),
+        -backend.log1p(backend.exp(-backend.abs(logits)))
+        - backend.maximum(-logits, 0.0),
+        -backend.log1p(backend.exp(-backend.abs(logits)))
+        - backend.maximum(logits, 0.0),
     )
-    return xp.mean(alpha_t * (1.0 - pt) ** gamma * (-log_pt))
+    return backend.mean(alpha_t * (1.0 - pt) ** gamma * (-log_pt))
 
 
 @vjp_rule(func=focal_loss)
 def _vjp_focal_loss(g, logits, y_true, gamma=2.0, alpha=0.25):
-    xp = get_xp(logits)
     N = logits.size
     p = sigmoid(logits)
-    pt = xp.where(y_true == 1, p, 1.0 - p)
-    alpha_t = xp.where(y_true == 1, alpha, 1.0 - alpha)
+    pt = backend.where(y_true == 1, p, 1.0 - p)
+    alpha_t = backend.where(y_true == 1, alpha, 1.0 - alpha)
     # sign flips because ∂pt/∂x = σ(1-σ) for y=1, -σ(1-σ) for y=0
-    sign = xp.where(y_true == 1, 1.0, -1.0)
+    sign = backend.where(y_true == 1, 1.0, -1.0)
     # ∂pt/∂x = sign · p · (1-p)
     dpt_dx = sign * p * (1.0 - p)
     # Exact product-rule gradient:
@@ -1559,15 +1469,17 @@ def _vjp_focal_loss(g, logits, y_true, gamma=2.0, alpha=0.25):
     #   -γ(1-pt)^(γ-1)·(-dpt_dx)·(-log pt) + (1-pt)^γ·(-dpt_dx/pt)
     #   = (1-pt)^(γ-1) · dpt_dx · [ γ·log(pt) - (1-pt)/pt ]
     # (with appropriate clipping to avoid 0^(γ-1) at pt=1)
-    one_minus_pt = xp.clip(1.0 - pt, safe_eps(pt), 1.0)
-    pt_safe = xp.clip(pt, safe_eps(pt), 1.0)
-    modulating = one_minus_pt ** xp.where(xp.array(gamma) >= 1.0, gamma - 1.0, 0.0)
+    one_minus_pt = backend.clip(1.0 - pt, safe_eps(pt), 1.0)
+    pt_safe = backend.clip(pt, safe_eps(pt), 1.0)
+    modulating = one_minus_pt ** backend.where(
+        backend.array(gamma) >= 1.0, gamma - 1.0, 0.0
+    )
     grad = (
         g
         * alpha_t
         * modulating
         * dpt_dx
-        * (gamma * xp.log(pt_safe) - one_minus_pt / pt_safe)
+        * (gamma * backend.log(pt_safe) - one_minus_pt / pt_safe)
         / N
     )
     return (grad, None)
@@ -1576,25 +1488,17 @@ def _vjp_focal_loss(g, logits, y_true, gamma=2.0, alpha=0.25):
 # ---------------------------------------------------------------------------
 # 13. Hinge Loss  (multi-class, SVM-style)
 # ---------------------------------------------------------------------------
-#
-#   ŷ : (N, C) — raw scores,  y : (N, C) — {-1, +1} labels
-#   (also handles binary case: ŷ (N,), y (N,) with y ∈ {-1,1})
-#
-#   L_i = max(0, 1 - y_i · ŷ_i)
-#   L   = mean(L_i)
-#
-#   ∂L/∂ŷ_i = -y_i / N  if  y_i · ŷ_i < 1,  else 0
+
+# Note: For the mathematical VJP derivation, see the VJP_RULES*.md documentation.
 
 
 def hinge_loss(y_pred, y_true):
     """Hinge loss: mean(max(0, 1 - y·ŷ)).  y ∈ {-1, +1}."""
-    xp = get_xp(y_pred)
-    return xp.mean(xp.maximum(0.0, 1.0 - y_true * y_pred))
+    return backend.mean(backend.maximum(0.0, 1.0 - y_true * y_pred))
 
 
 @vjp_rule(func=hinge_loss)
 def _vjp_hinge_loss(g, y_pred, y_true):
-    xp = get_xp(y_pred)
     N = y_pred.size
     # Indicator: 1 where margin is violated
     mask = (y_true * y_pred < 1.0).astype(y_pred.dtype)
@@ -1605,25 +1509,20 @@ def _vjp_hinge_loss(g, y_pred, y_true):
 # ---------------------------------------------------------------------------
 # 14. Squared Hinge Loss
 # ---------------------------------------------------------------------------
-#
-#   L_i = max(0, 1 - y·ŷ)²
-#   L   = mean(L_i)
-#
-#   ∂L/∂ŷ_i = -2 · y_i · max(0, 1 - y_i·ŷ_i) / N
+
+# Note: For the mathematical VJP derivation, see the VJP_RULES*.md documentation.
 
 
 def squared_hinge_loss(y_pred, y_true):
     """Squared hinge loss: mean(max(0, 1 - y·ŷ)²)."""
-    xp = get_xp(y_pred)
-    h = xp.maximum(0.0, 1.0 - y_true * y_pred)
-    return xp.mean(h * h)
+    h = backend.maximum(0.0, 1.0 - y_true * y_pred)
+    return backend.mean(h * h)
 
 
 @vjp_rule(func=squared_hinge_loss)
 def _vjp_squared_hinge_loss(g, y_pred, y_true):
-    xp = get_xp(y_pred)
     N = y_pred.size
-    h = xp.maximum(0.0, 1.0 - y_true * y_pred)
+    h = backend.maximum(0.0, 1.0 - y_true * y_pred)
     grad = g * (-2.0 * y_true * h) / N
     return (grad, None)
 
@@ -1631,62 +1530,44 @@ def _vjp_squared_hinge_loss(g, y_pred, y_true):
 # ---------------------------------------------------------------------------
 # 15. Cosine Embedding Loss
 # ---------------------------------------------------------------------------
-#
-#   u, v : (N, D)  — embedding vectors
-#   y    : (N,)    — +1 (similar) or -1 (dissimilar)
-#   margin m ∈ [0,1]
-#
-#   cos_sim(u,v) = <u,v> / (‖u‖·‖v‖)
-#
-#   L_i = 1 - cos_sim_i             if y_i = +1
-#         max(0, cos_sim_i - m)      if y_i = -1
-#   L   = mean(L_i)
-#
-#   Let  s = <u,v>,  nu = ‖u‖,  nv = ‖v‖,  c = s/(nu·nv)
-#
-#   ∂c/∂u = (v·nu·nv - u·s/nu) / (nu·nv)²  ·  nu·nv  =  (v - c·u/nu²) / (nu·nv)
-#          = v/(nu·nv) - c·u/nu²
-#   (symmetrically for ∂c/∂v)
-#
-#   ∂L_i/∂c_i = -1           if y_i=+1
-#               +1            if y_i=-1 and c_i > m
-#                0            otherwise
+
+# Note: For the mathematical VJP derivation, see the VJP_RULES*.md documentation.
 
 
 def cosine_embedding_loss(u, v, y, margin=0.0):
     """Cosine embedding loss for similarity/dissimilarity pairs."""
-    xp = get_xp(u)
     eps = safe_eps(u)
-    nu = xp.sqrt(xp.sum(u * u, axis=-1, keepdims=True)).clip(eps)
-    nv = xp.sqrt(xp.sum(v * v, axis=-1, keepdims=True)).clip(eps)
-    cos_sim = xp.sum(u * v, axis=-1) / (nu.squeeze(-1) * nv.squeeze(-1))
+    nu = backend.sqrt(backend.sum(u * u, axis=-1, keepdims=True)).clip(eps)
+    nv = backend.sqrt(backend.sum(v * v, axis=-1, keepdims=True)).clip(eps)
+    cos_sim = backend.sum(u * v, axis=-1) / (nu.squeeze(-1) * nv.squeeze(-1))
     loss_pos = 1.0 - cos_sim
-    loss_neg = xp.maximum(0.0, cos_sim - margin)
-    per_sample = xp.where(y == 1, loss_pos, loss_neg)
-    return xp.mean(per_sample)
+    loss_neg = backend.maximum(0.0, cos_sim - margin)
+    per_sample = backend.where(y == 1, loss_pos, loss_neg)
+    return backend.mean(per_sample)
 
 
 @vjp_rule(func=cosine_embedding_loss)
 def _vjp_cosine_embedding_loss(g, u, v, y, margin=0.0):
-    xp = get_xp(u)
     N = u.shape[0]
     eps = safe_eps(u)
-    nu = xp.sqrt(xp.sum(u * u, axis=-1, keepdims=True)).clip(eps)  # (N,1)
-    nv = xp.sqrt(xp.sum(v * v, axis=-1, keepdims=True)).clip(eps)
-    cos_sim = xp.sum(u * v, axis=-1) / (nu.squeeze(-1) * nv.squeeze(-1))  # (N,)
+    nu = backend.sqrt(backend.sum(u * u, axis=-1, keepdims=True)).clip(eps)  # (N,1)
+    nv = backend.sqrt(backend.sum(v * v, axis=-1, keepdims=True)).clip(eps)
+    cos_sim = backend.sum(u * v, axis=-1) / (nu.squeeze(-1) * nv.squeeze(-1))  # (N,)
 
     # ∂c/∂u_i = v/(nu·nv) - c·u/nu²  — shaped (N, D)
     nu_nv = nu * nv  # (N,1)
-    c = cos_sim[:, xp.newaxis]  # (N,1) broadcast
+    c = cos_sim[:, backend.newaxis]  # (N,1) broadcast
     dc_du = (v / nu_nv) - (c * u / (nu * nu))
     dc_dv = (u / nu_nv) - (c * v / (nv * nv))
 
     # ∂L_i/∂c_i  (scalar per sample)
-    dl_dc = xp.where(
+    dl_dc = backend.where(
         y == 1,
-        -xp.ones_like(cos_sim),
-        xp.where(cos_sim > margin, xp.ones_like(cos_sim), xp.zeros_like(cos_sim)),
-    )[:, xp.newaxis]  # (N,1)
+        -backend.ones_like(cos_sim),
+        backend.where(
+            cos_sim > margin, backend.ones_like(cos_sim), backend.zeros_like(cos_sim)
+        ),
+    )[:, backend.newaxis]  # (N,1)
 
     grad_u = g * dl_dc * dc_du / N
     grad_v = g * dl_dc * dc_dv / N
@@ -1696,46 +1577,32 @@ def _vjp_cosine_embedding_loss(g, u, v, y, margin=0.0):
 # ---------------------------------------------------------------------------
 # 16. Triplet Margin Loss
 # ---------------------------------------------------------------------------
-#
-#   a, p, n : (N, D)  — anchor, positive, negative embeddings
-#
-#   d(x,y) = ‖x - y‖₂
-#
-#   L_i = max(0, d(a,p)_i - d(a,n)_i + margin)
-#   L   = mean(L_i)
-#
-#   For samples where the loss > 0 ("active" triplets):
-#
-#   ∂d(a,p)/∂a = (a-p)/d(a,p)
-#   ∂d(a,p)/∂p = (p-a)/d(a,p)
-#   ∂d(a,n)/∂a = (a-n)/d(a,n)
-#   ∂d(a,n)/∂n = (n-a)/d(a,n)
-#
-#   ∂L/∂a = active · [ (a-p)/d(a,p) - (a-n)/d(a,n) ] / N
-#   ∂L/∂p = active · (p-a)/d(a,p)                     / N
-#   ∂L/∂n = active · -(n-a)/d(a,n)                    / N
+
+# Note: For the mathematical VJP derivation, see the VJP_RULES*.md documentation.
 
 
 def triplet_margin_loss(anchor, positive, negative, margin=1.0):
     """Triplet margin loss: mean(max(0, d(a,p) - d(a,n) + margin))."""
-    xp = get_xp(anchor)
     eps = safe_eps(anchor)
-    d_pos = xp.sqrt(xp.sum((anchor - positive) ** 2, axis=-1) + eps)
-    d_neg = xp.sqrt(xp.sum((anchor - negative) ** 2, axis=-1) + eps)
-    return xp.mean(xp.maximum(0.0, d_pos - d_neg + margin))
+    d_pos = backend.sqrt(backend.sum((anchor - positive) ** 2, axis=-1) + eps)
+    d_neg = backend.sqrt(backend.sum((anchor - negative) ** 2, axis=-1) + eps)
+    return backend.mean(backend.maximum(0.0, d_pos - d_neg + margin))
 
 
 @vjp_rule(func=triplet_margin_loss)
 def _vjp_triplet_margin_loss(g, anchor, positive, negative, margin=1.0):
-    xp = get_xp(anchor)
     N = anchor.shape[0]
     eps = safe_eps(anchor)
-    d_pos = xp.sqrt(xp.sum((anchor - positive) ** 2, axis=-1, keepdims=True) + eps)
-    d_neg = xp.sqrt(xp.sum((anchor - negative) ** 2, axis=-1, keepdims=True) + eps)
+    d_pos = backend.sqrt(
+        backend.sum((anchor - positive) ** 2, axis=-1, keepdims=True) + eps
+    )
+    d_neg = backend.sqrt(
+        backend.sum((anchor - negative) ** 2, axis=-1, keepdims=True) + eps
+    )
     # Active mask: samples where loss > 0
     active = ((d_pos.squeeze(-1) - d_neg.squeeze(-1) + margin) > 0.0).astype(
         anchor.dtype
-    )[:, xp.newaxis]  # (N,1)
+    )[:, backend.newaxis]  # (N,1)
 
     diff_pos = anchor - positive  # (N,D)
     diff_neg = anchor - negative
@@ -1749,44 +1616,32 @@ def _vjp_triplet_margin_loss(g, anchor, positive, negative, margin=1.0):
 # ---------------------------------------------------------------------------
 # 17. Dice Loss  (binary segmentation)
 # ---------------------------------------------------------------------------
-#
-#   ŷ, y ∈ [0,1] — predicted and true masks, shapes (N, ...) (any spatial dims)
-#
-#   dice_coeff = (2 · sum(ŷ·y) + ε) / (sum(ŷ) + sum(y) + ε)
-#   L = 1 - mean_over_batch(dice_coeff)
-#
-#   Let  I = sum(ŷ·y),  Sp = sum(ŷ),  St = sum(y),  D = 2I+ε,  denom = Sp+St+ε
-#
-#   ∂dice/∂ŷ_i = [ 2·y_i·denom - 2·I·2 ] / denom²
-#              = 2·(y_i·denom - 2·I) / denom²
-#
-#   (reduction is sum per sample, mean over batch — handled by 1/N factor)
+
+# Note: For the mathematical VJP derivation, see the VJP_RULES*.md documentation.
 
 
 def dice_loss(y_pred, y_true, eps=1.0):
     """Dice loss for binary segmentation: 1 - Dice coefficient.
     eps=1.0 (Laplace smoothing) prevents division by zero on empty masks.
     """
-    xp = get_xp(y_pred)
     # Flatten all spatial dims per sample; keep batch dim
     flat_pred = y_pred.reshape(y_pred.shape[0], -1)
     flat_true = y_true.reshape(y_true.shape[0], -1)
-    intersection = xp.sum(flat_pred * flat_true, axis=1)
-    sum_pred = xp.sum(flat_pred, axis=1)
-    sum_true = xp.sum(flat_true, axis=1)
+    intersection = backend.sum(flat_pred * flat_true, axis=1)
+    sum_pred = backend.sum(flat_pred, axis=1)
+    sum_true = backend.sum(flat_true, axis=1)
     dice = (2.0 * intersection + eps) / (sum_pred + sum_true + eps)
-    return xp.mean(1.0 - dice)
+    return backend.mean(1.0 - dice)
 
 
 @vjp_rule(func=dice_loss)
 def _vjp_dice_loss(g, y_pred, y_true, eps=1.0):
-    xp = get_xp(y_pred)
     N = y_pred.shape[0]
     flat_pred = y_pred.reshape(N, -1)
     flat_true = y_true.reshape(N, -1)
-    intersection = xp.sum(flat_pred * flat_true, axis=1, keepdims=True)  # (N,1)
-    sum_pred = xp.sum(flat_pred, axis=1, keepdims=True)
-    sum_true = xp.sum(flat_true, axis=1, keepdims=True)
+    intersection = backend.sum(flat_pred * flat_true, axis=1, keepdims=True)  # (N,1)
+    sum_pred = backend.sum(flat_pred, axis=1, keepdims=True)
+    sum_true = backend.sum(flat_true, axis=1, keepdims=True)
     denom = sum_pred + sum_true + eps  # (N,1)
     numer = 2.0 * intersection + eps  # (N,1)  = T in derivation
     # Quotient rule on dice = T/D:
@@ -1800,58 +1655,31 @@ def _vjp_dice_loss(g, y_pred, y_true, eps=1.0):
 # ---------------------------------------------------------------------------
 # 18. Tversky Loss  (generalised Dice with α/β asymmetry)
 # ---------------------------------------------------------------------------
-#
-#   TP = sum(ŷ·y),  FP = sum(ŷ·(1-y)),  FN = sum((1-ŷ)·y)
-#
-#   tversky = (TP + ε) / (TP + α·FP + β·FN + ε)
-#   L = 1 - mean(tversky)
-#
-#   Note: α=β=0.5 → Dice;  α=β=1 → Jaccard (IoU) up to normalisation.
-#
-#   Exact gradients (via quotient rule, per sample):
-#
-#   Let D = TP + α·FP + β·FN + ε,  T = TP + ε
-#
-#   ∂TP/∂ŷ  = y
-#   ∂FP/∂ŷ  = 1-y
-#   ∂FN/∂ŷ  = -(y)     [FN = sum((1-ŷ)·y) → ∂/∂ŷ = -y]
-#
-#   ∂D/∂ŷ   = y + α(1-y) - β·y  =  y(1-α+... wait, let me be careful:
-#             ∂D/∂ŷ_i = ∂TP/∂ŷ_i + α·∂FP/∂ŷ_i + β·∂FN/∂ŷ_i
-#                     = y_i + α(1-y_i) - β·y_i
-#                     = y_i(1 - α - β... no:
-#             ∂FN/∂ŷ_i = ∂[(1-ŷ_i)·y_i]/∂ŷ_i = -y_i
-#             ∂D/∂ŷ_i  = y_i + α(1-y_i) + β(-y_i)
-#                      = y_i(1 - α - β... let me just keep it explicit:
-#             dD = y + α(1-y) - β·y
-#   ∂T/∂ŷ   = y
-#
-#   ∂tversky/∂ŷ = (y·D - T·(y + α(1-y) - β·y)) / D²
+
+# Note: For the mathematical VJP derivation, see the VJP_RULES*.md documentation.
 
 
 def tversky_loss(y_pred, y_true, alpha=0.3, beta=0.7, eps=1.0):
     """Tversky loss: 1 - Tversky index.  α controls FP, β controls FN penalty."""
-    xp = get_xp(y_pred)
     N = y_pred.shape[0]
     flat_pred = y_pred.reshape(N, -1)
     flat_true = y_true.reshape(N, -1)
-    TP = xp.sum(flat_pred * flat_true, axis=1)
-    FP = xp.sum(flat_pred * (1.0 - flat_true), axis=1)
-    FN = xp.sum((1.0 - flat_pred) * flat_true, axis=1)
+    TP = backend.sum(flat_pred * flat_true, axis=1)
+    FP = backend.sum(flat_pred * (1.0 - flat_true), axis=1)
+    FN = backend.sum((1.0 - flat_pred) * flat_true, axis=1)
     tversky = (TP + eps) / (TP + alpha * FP + beta * FN + eps)
-    return xp.mean(1.0 - tversky)
+    return backend.mean(1.0 - tversky)
 
 
 @vjp_rule(func=tversky_loss)
 def _vjp_tversky_loss(g, y_pred, y_true, alpha=0.3, beta=0.7, eps=1.0):
-    xp = get_xp(y_pred)
     N = y_pred.shape[0]
     flat_pred = y_pred.reshape(N, -1)
     flat_true = y_true.reshape(N, -1)
 
-    TP = xp.sum(flat_pred * flat_true, axis=1, keepdims=True)  # (N,1)
-    FP = xp.sum(flat_pred * (1.0 - flat_true), axis=1, keepdims=True)
-    FN = xp.sum((1.0 - flat_pred) * flat_true, axis=1, keepdims=True)
+    TP = backend.sum(flat_pred * flat_true, axis=1, keepdims=True)  # (N,1)
+    FP = backend.sum(flat_pred * (1.0 - flat_true), axis=1, keepdims=True)
+    FN = backend.sum((1.0 - flat_pred) * flat_true, axis=1, keepdims=True)
 
     D = TP + alpha * FP + beta * FN + eps  # denominator
     T = TP + eps  # numerator
@@ -1871,85 +1699,49 @@ def _vjp_tversky_loss(g, y_pred, y_true, alpha=0.3, beta=0.7, eps=1.0):
 # ---------------------------------------------------------------------------
 # 19. Wasserstein Loss  (WGAN critic objective)
 # ---------------------------------------------------------------------------
-#
-#   scores_real : (N,) — critic scores for real samples
-#   scores_fake : (N,) — critic scores for fake/generated samples
-#
-#   L = mean(scores_fake) - mean(scores_real)   [critic maximises this → loss]
-#
-#   ∂L/∂scores_real_i = -1/N
-#   ∂L/∂scores_fake_i = +1/N
+
+# Note: For the mathematical VJP derivation, see the VJP_RULES*.md documentation.
 
 
 def wasserstein_loss(scores_real, scores_fake):
     """WGAN critic loss: mean(fake) - mean(real).  Minimise for the critic."""
-    xp = get_xp(scores_real)
-    return xp.mean(scores_fake) - xp.mean(scores_real)
+    return backend.mean(scores_fake) - backend.mean(scores_real)
 
 
 @vjp_rule(func=wasserstein_loss)
 def _vjp_wasserstein_loss(g, scores_real, scores_fake):
     N_real = scores_real.size
     N_fake = scores_fake.size
-    xp = get_xp(scores_real)
-    grad_real = g * xp.full_like(scores_real, -1.0 / N_real)
-    grad_fake = g * xp.full_like(scores_fake, +1.0 / N_fake)
+    grad_real = g * backend.full_like(scores_real, -1.0 / N_real)
+    grad_fake = g * backend.full_like(scores_fake, +1.0 / N_fake)
     return (grad_real, grad_fake)
 
 
 # ---------------------------------------------------------------------------
 # 20. SSIM Loss  (Structural Similarity Index, patch-level)
 # ---------------------------------------------------------------------------
-#
-#   x, y : (N, H, W) or (N, C, H, W) — images in [0,1]
-#
-#   Computed globally over each (H,W) plane (no sliding window convolution),
-#   which gives a closed-form analytic gradient with no approximation.
-#
-#   μ_x = mean(x),  μ_y = mean(y)
-#   σ_x² = var(x),  σ_y² = var(y),  σ_xy = cov(x,y)
-#
-#   c1=(k1·L)², c2=(k2·L)²  with L=1.0, k1=0.01, k2=0.03
-#
-#   SSIM = (2μ_xμ_y + c1)(2σ_xy + c2) / [(μ_x²+μ_y²+c1)(σ_x²+σ_y²+c2)]
-#   L    = 1 - mean(SSIM_per_image)
-#
-#   Exact partial derivatives via quotient rule:
-#
-#   Let A=(2μ_xμ_y+c1), B=(2σ_xy+c2), C=(μ_x²+μ_y²+c1), D=(σ_x²+σ_y²+c2)
-#   SSIM = AB/(CD)
-#
-#   ∂SSIM/∂x_i = (∂A/∂x_i·B·C·D + A·∂B/∂x_i·C·D
-#                 - A·B·∂C/∂x_i·D - A·B·C·∂D/∂x_i) / (C·D)²
-#
-#   where (per pixel x_i, mean over P pixels):
-#   ∂μ_x/∂x_i = 1/P
-#   ∂σ_x²/∂x_i = 2(x_i - μ_x)/P
-#   ∂σ_xy/∂x_i = (y_i - μ_y)/P
-#
-#   ∂A/∂x_i = 2μ_y / P
-#   ∂B/∂x_i = 2(y_i - μ_y) / P
-#   ∂C/∂x_i = 2μ_x / P
-#   ∂D/∂x_i = 2(x_i - μ_x) / P
+
+# Note: For the mathematical VJP derivation, see the VJP_RULES*.md documentation.
 
 
 def ssim_loss(x, y, k1=0.01, k2=0.03, L=1.0):
     """1 - SSIM.  x, y: (N, H, W) or (N, C, H, W), values in [0,1]."""
-    xp = get_xp(x)
     # Flatten spatial dims: work on (N, P) where P=C*H*W or H*W
     N = x.shape[0]
-    xf = x.reshape(N, -1).astype(xp.float64 if x.dtype == xp.float32 else x.dtype)
+    xf = x.reshape(N, -1).astype(
+        backend.float64 if x.dtype == backend.float32 else x.dtype
+    )
     yf = y.reshape(N, -1).astype(xf.dtype)
     P = xf.shape[1]
 
     c1, c2 = (k1 * L) ** 2, (k2 * L) ** 2
-    mu_x = xp.mean(xf, axis=1, keepdims=True)  # (N,1)
-    mu_y = xp.mean(yf, axis=1, keepdims=True)
+    mu_x = backend.mean(xf, axis=1, keepdims=True)  # (N,1)
+    mu_y = backend.mean(yf, axis=1, keepdims=True)
     dx = xf - mu_x
     dy = yf - mu_y
-    var_x = xp.mean(dx * dx, axis=1)  # (N,)
-    var_y = xp.mean(dy * dy, axis=1)
-    cov_xy = xp.mean(dx * dy, axis=1)
+    var_x = backend.mean(dx * dx, axis=1)  # (N,)
+    var_y = backend.mean(dy * dy, axis=1)
+    cov_xy = backend.mean(dx * dy, axis=1)
 
     A = 2.0 * mu_x.squeeze(1) * mu_y.squeeze(1) + c1
     B = 2.0 * cov_xy + c2
@@ -1957,32 +1749,33 @@ def ssim_loss(x, y, k1=0.01, k2=0.03, L=1.0):
     D = var_x + var_y + c2
 
     ssim_map = (A * B) / (C * D)
-    return xp.mean(1.0 - ssim_map).astype(x.dtype)
+    return backend.mean(1.0 - ssim_map).astype(x.dtype)
 
 
 @vjp_rule(func=ssim_loss)
 def _vjp_ssim_loss(g, x, y, k1=0.01, k2=0.03, L=1.0):
-    xp = get_xp(x)
     N = x.shape[0]
     orig_shape = x.shape
-    xf = x.reshape(N, -1).astype(xp.float64 if x.dtype == xp.float32 else x.dtype)
+    xf = x.reshape(N, -1).astype(
+        backend.float64 if x.dtype == backend.float32 else x.dtype
+    )
     yf = y.reshape(N, -1).astype(xf.dtype)
     P = xf.shape[1]
 
     c1, c2 = (k1 * L) ** 2, (k2 * L) ** 2
-    mu_x = xp.mean(xf, axis=1, keepdims=True)  # (N,1)
-    mu_y = xp.mean(yf, axis=1, keepdims=True)
+    mu_x = backend.mean(xf, axis=1, keepdims=True)  # (N,1)
+    mu_y = backend.mean(yf, axis=1, keepdims=True)
     dx = xf - mu_x
     dy = yf - mu_y
-    var_x = xp.mean(dx * dx, axis=1)  # (N,)
-    var_y = xp.mean(dy * dy, axis=1)
-    cov_xy = xp.mean(dx * dy, axis=1)
+    var_x = backend.mean(dx * dx, axis=1)  # (N,)
+    var_y = backend.mean(dy * dy, axis=1)
+    cov_xy = backend.mean(dx * dy, axis=1)
 
     A = 2.0 * mu_x.squeeze(1) * mu_y.squeeze(1) + c1  # (N,)
     B = 2.0 * cov_xy + c2
     C = mu_x.squeeze(1) ** 2 + mu_y.squeeze(1) ** 2 + c1
     D = var_x + var_y + c2
-    CD = (C * D)[:, xp.newaxis]  # (N,1)
+    CD = (C * D)[:, backend.newaxis]  # (N,1)
     CD2 = CD * CD
 
     # ∂SSIM/∂x_i via quotient rule (all quantities shaped (N,P) after broadcast)
@@ -1995,10 +1788,10 @@ def _vjp_ssim_loss(g, x, y, k1=0.01, k2=0.03, L=1.0):
     # ∂D/∂x_i = 2(x_i - μ_x) / P
     dD = 2.0 * dx / P  # (N,P)
 
-    A_ = A[:, xp.newaxis]
-    B_ = B[:, xp.newaxis]
-    C_ = C[:, xp.newaxis]
-    D_ = D[:, xp.newaxis]
+    A_ = A[:, backend.newaxis]
+    B_ = B[:, backend.newaxis]
+    C_ = C[:, backend.newaxis]
+    D_ = D[:, backend.newaxis]
 
     # d(SSIM)/dx_i  =  [dA·B·C·D + A·dB·C·D - A·B·dC·D - A·B·C·dD] / (C·D)²
     num_grad = (
@@ -2007,3 +1800,619 @@ def _vjp_ssim_loss(g, x, y, k1=0.01, k2=0.03, L=1.0):
     # L = 1 - mean(SSIM) → ∂L/∂x = -∂SSIM/∂x / N
     grad_flat = g * (-num_grad / CD2) / N
     return (grad_flat.reshape(orig_shape).astype(x.dtype), None)
+
+
+# ===========================================================================
+# Recurrent & Sequence VJP rules  (from VJP_RULES_RECURRENT.md)
+# ===========================================================================
+#
+# Design contract
+# ---------------
+# * Every forward function receives and returns plain arrays, not Tensors.
+# * Caches needed for the backward (intermediate activations) are re-computed
+#   inside each VJP from the same forward call, keeping the API stateless.
+# * All ops are fully backend-agnostic — only backend.* calls, no np/cp.
+# * BPTT is handled inside each VJP; the compute graph sees one node per layer.
+
+
+# ---------------------------------------------------------------------------
+# 1. Simple (Elman) RNN
+# ---------------------------------------------------------------------------
+
+# Note: For the mathematical VJP derivation, see the VJP_RULES*.md documentation.
+
+
+def _rnn_forward_cache(x, Wh, Wx, bh, h0):
+    """Run forward pass and return (h_seq, h0) for BPTT."""
+    B, T, _ = x.shape
+    d_h = Wh.shape[0]
+    if h0 is None:
+        h0 = backend.zeros((B, d_h), dtype=x.dtype)
+    h_seq = backend.zeros((B, T, d_h), dtype=x.dtype)
+    h_prev = h0
+    for t in range(T):
+        h_t = backend.tanh(h_prev @ Wh + x[:, t, :] @ Wx + bh)
+        h_seq[:, t, :] = h_t
+        h_prev = h_t
+    return h_seq, h0
+
+
+def rnn_cell(x, Wh, Wx, bh, h0=None):
+    """Simple Elman RNN forward over a full sequence → h_seq (B, T, d_h)."""
+    h_seq, _ = _rnn_forward_cache(x, Wh, Wx, bh, h0)
+    return h_seq
+
+
+@vjp_rule(func=rnn_cell)
+def _vjp_rnn_cell(g, x, Wh, Wx, bh, h0=None):
+    """BPTT VJP for Simple RNN.  g : (B, T, d_h).  Returns (dx, dWh, dWx, dbh, dh0)."""
+    h_seq, h0_used = _rnn_forward_cache(x, Wh, Wx, bh, h0)
+    B, T, _ = x.shape
+    d_h = Wh.shape[0]
+    dx = backend.zeros_like(x)
+    dWh = backend.zeros_like(Wh)
+    dWx = backend.zeros_like(Wx)
+    dbh = backend.zeros_like(bh)
+    dh_next = backend.zeros((B, d_h), dtype=x.dtype)
+    for t in reversed(range(T)):
+        h_t = h_seq[:, t, :]
+        h_prev = h_seq[:, t - 1, :] if t > 0 else h0_used
+        delta = (g[:, t, :] + dh_next) * (1.0 - h_t**2)
+        dWh += h_prev.T @ delta
+        dWx += x[:, t, :].T @ delta
+        dbh += delta.sum(axis=0)
+        dh_next = delta @ Wh.T
+        dx[:, t, :] = delta @ Wx.T
+    return (dx, dWh, dWx, dbh, dh_next)
+
+
+# ---------------------------------------------------------------------------
+# 2. LSTM
+# ---------------------------------------------------------------------------
+
+# Note: For the mathematical VJP derivation, see the VJP_RULES*.md documentation.
+
+
+def _lstm_forward_cache(x, W, b, h0, c0):
+    B, T, d_in = x.shape
+    d_h = W.shape[1] // 4
+    if h0 is None:
+        h0 = backend.zeros((B, d_h), dtype=x.dtype)
+    if c0 is None:
+        c0 = backend.zeros((B, d_h), dtype=x.dtype)
+    h_seq = backend.zeros((B, T, d_h), dtype=x.dtype)
+    c_seq = backend.zeros((B, T, d_h), dtype=x.dtype)
+    f_seq = backend.zeros((B, T, d_h), dtype=x.dtype)
+    i_seq = backend.zeros((B, T, d_h), dtype=x.dtype)
+    ct_seq = backend.zeros((B, T, d_h), dtype=x.dtype)
+    o_seq = backend.zeros((B, T, d_h), dtype=x.dtype)
+    h_prev, c_prev = h0, c0
+    for t in range(T):
+        z_t = backend.concatenate([h_prev, x[:, t, :]], axis=1)
+        gs = z_t @ W + b
+        f_t = sigmoid(gs[:, :d_h])
+        i_t = sigmoid(gs[:, d_h : 2 * d_h])
+        ct_t = backend.tanh(gs[:, 2 * d_h : 3 * d_h])
+        o_t = sigmoid(gs[:, 3 * d_h :])
+        c_t = f_t * c_prev + i_t * ct_t
+        h_t = o_t * backend.tanh(c_t)
+        h_seq[:, t, :] = h_t
+        c_seq[:, t, :] = c_t
+        f_seq[:, t, :] = f_t
+        i_seq[:, t, :] = i_t
+        ct_seq[:, t, :] = ct_t
+        o_seq[:, t, :] = o_t
+        h_prev, c_prev = h_t, c_t
+    return h_seq, c_seq, f_seq, i_seq, ct_seq, o_seq, h0, c0
+
+
+def lstm_cell(x, W, b, h0=None, c0=None):
+    """LSTM forward over a full sequence → h_seq (B, T, d_h)."""
+    h_seq, *_ = _lstm_forward_cache(x, W, b, h0, c0)
+    return h_seq
+
+
+@vjp_rule(func=lstm_cell)
+def _vjp_lstm_cell(g, x, W, b, h0=None, c0=None):
+    """BPTT VJP for LSTM.  g : (B, T, d_h).  Returns (dx, dW, db, dh0, dc0)."""
+    h_seq, c_seq, f_seq, i_seq, ct_seq, o_seq, h0_u, c0_u = _lstm_forward_cache(
+        x, W, b, h0, c0
+    )
+    B, T, _ = x.shape
+    d_h = W.shape[1] // 4
+    dx = backend.zeros_like(x)
+    dW = backend.zeros_like(W)
+    db = backend.zeros_like(b)
+    dh_next = backend.zeros((B, d_h), dtype=x.dtype)
+    dc_next = backend.zeros((B, d_h), dtype=x.dtype)
+    for t in reversed(range(T)):
+        c_t = c_seq[:, t, :]
+        f_t = f_seq[:, t, :]
+        i_t = i_seq[:, t, :]
+        ct_t = ct_seq[:, t, :]
+        o_t = o_seq[:, t, :]
+        c_prev = c_seq[:, t - 1, :] if t > 0 else c0_u
+        h_prev = h_seq[:, t - 1, :] if t > 0 else h0_u
+        dh_t = g[:, t, :] + dh_next
+        d_ot = dh_t * backend.tanh(c_t)
+        dc_total = dc_next + dh_t * o_t * (1.0 - backend.tanh(c_t) ** 2)
+        d_ft = dc_total * c_prev
+        d_it = dc_total * ct_t
+        d_ctt = dc_total * i_t
+        dc_next = dc_total * f_t
+        delta_f = d_ft * f_t * (1.0 - f_t)
+        delta_i = d_it * i_t * (1.0 - i_t)
+        delta_ct = d_ctt * (1.0 - ct_t**2)
+        delta_o = d_ot * o_t * (1.0 - o_t)
+        Delta = backend.concatenate([delta_f, delta_i, delta_ct, delta_o], axis=1)
+        z_t = backend.concatenate([h_prev, x[:, t, :]], axis=1)
+        dW += z_t.T @ Delta
+        db += Delta.sum(axis=0)
+        dz = Delta @ W.T
+        dh_next = dz[:, :d_h]
+        dx[:, t, :] = dz[:, d_h:]
+    return (dx, dW, db, dh_next, dc_next)
+
+
+# ---------------------------------------------------------------------------
+# 3. GRU
+# ---------------------------------------------------------------------------
+
+# Note: For the mathematical VJP derivation, see the VJP_RULES*.md documentation.
+
+
+def _gru_forward_cache(x, Wr, Wz, Wh, br, bz, bh, h0):
+    B, T, _ = x.shape
+    d_h = Wr.shape[1]
+    if h0 is None:
+        h0 = backend.zeros((B, d_h), dtype=x.dtype)
+    h_seq = backend.zeros((B, T, d_h), dtype=x.dtype)
+    r_seq = backend.zeros((B, T, d_h), dtype=x.dtype)
+    z_seq = backend.zeros((B, T, d_h), dtype=x.dtype)
+    ht_seq = backend.zeros((B, T, d_h), dtype=x.dtype)
+    h_prev = h0
+    for t in range(T):
+        xh = backend.concatenate([h_prev, x[:, t, :]], axis=1)
+        r_t = sigmoid(xh @ Wr + br)
+        z_t = sigmoid(xh @ Wz + bz)
+        rh = backend.concatenate([r_t * h_prev, x[:, t, :]], axis=1)
+        ht_t = backend.tanh(rh @ Wh + bh)
+        h_t = (1.0 - z_t) * h_prev + z_t * ht_t
+        h_seq[:, t, :] = h_t
+        r_seq[:, t, :] = r_t
+        z_seq[:, t, :] = z_t
+        ht_seq[:, t, :] = ht_t
+        h_prev = h_t
+    return h_seq, r_seq, z_seq, ht_seq, h0
+
+
+def gru_cell(x, Wr, Wz, Wh, br, bz, bh, h0=None):
+    """GRU forward over a full sequence → h_seq (B, T, d_h)."""
+    h_seq, *_ = _gru_forward_cache(x, Wr, Wz, Wh, br, bz, bh, h0)
+    return h_seq
+
+
+@vjp_rule(func=gru_cell)
+def _vjp_gru_cell(g, x, Wr, Wz, Wh, br, bz, bh, h0=None):
+    """BPTT VJP for GRU.  Returns (dx, dWr, dWz, dWh, dbr, dbz, dbh, dh0)."""
+    h_seq, r_seq, z_seq, ht_seq, h0_u = _gru_forward_cache(
+        x, Wr, Wz, Wh, br, bz, bh, h0
+    )
+    B, T, _ = x.shape
+    d_h = Wr.shape[1]
+    dx = backend.zeros_like(x)
+    dWr = backend.zeros_like(Wr)
+    dWz = backend.zeros_like(Wz)
+    dWh = backend.zeros_like(Wh)
+    dbr = backend.zeros_like(br)
+    dbz = backend.zeros_like(bz)
+    dbh = backend.zeros_like(bh)
+    dh_next = backend.zeros((B, d_h), dtype=x.dtype)
+    for t in reversed(range(T)):
+        r_t = r_seq[:, t, :]
+        z_t = z_seq[:, t, :]
+        ht_t = ht_seq[:, t, :]
+        h_prev = h_seq[:, t - 1, :] if t > 0 else h0_u
+        dh_t = g[:, t, :] + dh_next
+        # Step 1 — hidden update
+        d_htt = dh_t * z_t
+        d_zt = dh_t * (ht_t - h_prev)
+        dh_prev1 = dh_t * (1.0 - z_t)
+        # Step 2 — candidate h̃_t
+        delta_ht = d_htt * (1.0 - ht_t**2)
+        rh = backend.concatenate([r_t * h_prev, x[:, t, :]], axis=1)
+        dWh += rh.T @ delta_ht
+        dbh += delta_ht.sum(axis=0)
+        d_rh = delta_ht @ Wh.T
+        d_roh = d_rh[:, :d_h]
+        dx_ht = d_rh[:, d_h:]
+        # Step 3 — reset gate multiplication
+        d_rt = d_roh * h_prev
+        dh_prev2 = d_roh * r_t
+        # Step 4 — reset gate sigmoid
+        xh = backend.concatenate([h_prev, x[:, t, :]], axis=1)
+        delta_r = d_rt * r_t * (1.0 - r_t)
+        dWr += xh.T @ delta_r
+        dbr += delta_r.sum(axis=0)
+        d_xh_r = delta_r @ Wr.T
+        dh_prev3 = d_xh_r[:, :d_h]
+        dx_r = d_xh_r[:, d_h:]
+        # Step 5 — update gate sigmoid
+        delta_z = d_zt * z_t * (1.0 - z_t)
+        dWz += xh.T @ delta_z
+        dbz += delta_z.sum(axis=0)
+        d_xh_z = delta_z @ Wz.T
+        dh_prev4 = d_xh_z[:, :d_h]
+        dx_z = d_xh_z[:, d_h:]
+        # Step 6 — accumulate
+        dh_next = dh_prev1 + dh_prev2 + dh_prev3 + dh_prev4
+        dx[:, t, :] = dx_ht + dx_r + dx_z
+    return (dx, dWr, dWz, dWh, dbr, dbz, dbh, dh_next)
+
+
+# ---------------------------------------------------------------------------
+# 4. Layer Normalization
+# ---------------------------------------------------------------------------
+
+# Note: For the mathematical VJP derivation, see the VJP_RULES*.md documentation.
+
+
+def layer_norm(x, gamma, beta, eps=1e-5):
+    """Layer normalization: y = γ·norm(x) + β, normalized over last axis."""
+    mu = backend.mean(x, axis=-1, keepdims=True)
+    var = backend.mean((x - mu) ** 2, axis=-1, keepdims=True)
+    x_hat = (x - mu) / backend.sqrt(var + eps)
+    return gamma * x_hat + beta
+
+
+@vjp_rule(func=layer_norm)
+def _vjp_layer_norm(g, x, gamma, beta, eps=1e-5):
+    """Closed-form VJP for LayerNorm.  Returns (dx, dgamma, dbeta)."""
+    mu = backend.mean(x, axis=-1, keepdims=True)
+    var = backend.mean((x - mu) ** 2, axis=-1, keepdims=True)
+    std = backend.sqrt(var + eps)
+    x_hat = (x - mu) / std
+    D = x.shape[-1]
+    g_x_hat = g * gamma
+    # Reduce over all axes except the last (the normalised dim)
+    reduce_axes = tuple(range(x.ndim - 1))
+    dgamma = (g * x_hat).sum(axis=reduce_axes)
+    dbeta = g.sum(axis=reduce_axes)
+    dx = (1.0 / (D * std)) * (
+        D * g_x_hat
+        - backend.sum(g_x_hat, axis=-1, keepdims=True)
+        - x_hat * backend.sum(g_x_hat * x_hat, axis=-1, keepdims=True)
+    )
+    return (dx, dgamma, dbeta)
+
+
+# ---------------------------------------------------------------------------
+# 5. Gather / Embedding Lookup
+# ---------------------------------------------------------------------------
+
+# Note: For the mathematical VJP derivation, see the VJP_RULES*.md documentation.
+
+
+def gather(table, idx):
+    """Gather rows of *table* at integer indices *idx* (any shape).
+
+    Parameters
+    ----------
+    table : (V, d) weight matrix
+    idx   : integer index array, any shape
+
+    Returns
+    -------
+    y : (*idx.shape, d)
+    """
+    if hasattr(idx, "data"):
+        idx = idx.data
+    idx_array = backend.asarray(idx, dtype=int)
+    return table[idx_array]
+
+
+# Legacy alias kept for backwards compatibility.
+embedding_lookup = gather
+
+
+def embedding(table, idx):
+    return gather(table, idx)
+
+
+@vjp_rule(func=embedding)
+def _vjp_embedding(g, table, idx):
+    return _vjp_gather(g, table, idx)
+
+
+@vjp_rule(func=gather)
+def _vjp_gather(g, table, idx):
+    """VJP for gather/embedding — sparse scatter-add.  Returns (d_table, None)."""
+    d_table = backend.zeros_like(table)
+    backend.add.at(d_table, idx, g)
+    return (d_table, None)
+
+
+# Also register under the old name so any orphaned VJP_RULES lookups still hit.
+VJP_RULES[embedding_lookup] = _vjp_gather
+
+
+# ---------------------------------------------------------------------------
+# 6. Scaled Dot-Product Attention
+# ---------------------------------------------------------------------------
+
+# Note: For the mathematical VJP derivation, see the VJP_RULES*.md documentation.
+
+
+def scaled_dot_product_attention(Q, K, V, mask=None):
+    """Scaled dot-product attention → out (B, N, d_v)."""
+    d_k = Q.shape[-1]
+    scale = backend.sqrt(backend.array(float(d_k), dtype=Q.dtype))
+    E = backend.matmul(Q, backend.swapaxes(K, -1, -2)) / scale
+    if mask is not None:
+        E = backend.where(mask, backend.full_like(E, -1e9), E)
+    A = softmax(E, axis=-1)
+    return backend.matmul(A, V)
+
+
+@vjp_rule(func=scaled_dot_product_attention)
+def _vjp_scaled_dot_product_attention(g, Q, K, V, mask=None):
+    """Exact VJP for scaled dot-product attention.  Returns (dQ, dK, dV, None)."""
+    d_k = Q.shape[-1]
+    scale = backend.sqrt(backend.array(float(d_k), dtype=Q.dtype))
+    E = backend.matmul(Q, backend.swapaxes(K, -1, -2)) / scale
+    if mask is not None:
+        E = backend.where(mask, backend.full_like(E, -1e9), E)
+    A = softmax(E, axis=-1)
+
+    # Step 1 — dV and dA
+    dV = backend.matmul(backend.swapaxes(A, -1, -2), g)  # (B, M, d_v)
+    dA = backend.matmul(g, backend.swapaxes(V, -1, -2))  # (B, N, M)
+
+    # Step 2 — softmax VJP: dE = A ⊙ (dA − rowsum(A ⊙ dA))
+    dE = A * (dA - backend.sum(A * dA, axis=-1, keepdims=True))
+    dE = dE / scale
+
+    # Step 3 — dQ and dK
+    dQ = backend.matmul(dE, K)  # (B, N, d_k)
+    dK = backend.matmul(backend.swapaxes(dE, -1, -2), Q)  # (B, M, d_k)
+
+    return (dQ, dK, dV, None)
+
+
+# ---------------------------------------------------------------------------
+# 7. Advanced Complex Operations (RoPE, FlashAttention, Sinkhorn, NeuralODE, S4)
+# ---------------------------------------------------------------------------
+
+# Note: For the mathematical VJP derivation, see the VJP_RULES*.md documentation.
+
+
+def rope(x, cos_freqs, sin_freqs):
+    """
+    Rotary Position Embedding (RoPE) forward pass.
+    Assumes the last dimension is split in half for rotation.
+    """
+    d = x.shape[-1]
+    x1, x2 = x[..., : d // 2], x[..., d // 2 :]
+    out1 = x1 * cos_freqs - x2 * sin_freqs
+    out2 = x1 * sin_freqs + x2 * cos_freqs
+    return backend.concatenate([out1, out2], axis=-1)
+
+
+@vjp_rule(func=rope)
+def _vjp_rope(g, x, cos_freqs, sin_freqs):
+    """VJP for RoPE applies the exact same rotation but with a negative angle."""
+    # cos(-t) = cos(t), sin(-t) = -sin(t)
+    gx = rope(g, cos_freqs, -sin_freqs)
+    # No gradients flow to the frequency tensors.
+    return (gx, None, None)
+
+
+def flash_attention(Q, K, V, mask=None):
+    """
+    Simulated flash-attention forward (standard math, identical output).
+    Real hardware flash-attention uses custom CUDA kernels.
+    """
+    return scaled_dot_product_attention(Q, K, V, mask=mask)
+
+
+@vjp_rule(func=flash_attention)
+def _vjp_flash_attention(g, Q, K, V, mask=None):
+    """
+    Simulated FlashAttention backward.
+    In a true implementation, this recomputes the attention matrix tile-by-tile
+    in SRAM to achieve O(1) memory. Here we simulate the mathematical gradients.
+    """
+    return _vjp_scaled_dot_product_attention(g, Q, K, V, mask=mask)
+
+
+def sinkhorn(a, b, M, reg, num_iters=20):
+    """
+    Sinkhorn-Knopp algorithm for Optimal Transport.
+    Returns the optimal coupling matrix P.
+    """
+    K = backend.exp(-M / reg)
+    u = backend.ones_like(a) / a.shape[-1]
+
+    # Expand dims for proper batched matrix-vector multiplication
+    u = backend.expand_dims(u, -1)
+    b_ = backend.expand_dims(b, -1)
+    a_ = backend.expand_dims(a, -1)
+
+    for _ in range(num_iters):
+        v = b_ / (backend.matmul(backend.swapaxes(K, -1, -2), u) + safe_eps(b_))
+        u = a_ / (backend.matmul(K, v) + safe_eps(a_))
+
+    return u * K * backend.swapaxes(v, -1, -2)
+
+
+@vjp_rule(func=sinkhorn)
+def _vjp_sinkhorn(g, a, b, M, reg, num_iters=20):
+    """
+    VJP for Sinkhorn via Implicit Function Theorem (simulated approximation).
+    Avoids unrolling the loop overhead.
+    """
+    P = sinkhorn(a, b, M, reg, num_iters)
+    dM = -(1.0 / reg) * P * (g - backend.sum(g * P, axis=-1, keepdims=True))
+    return (None, None, dM, None, None)
+
+
+def neural_ode_solve(z0, t_span, steps=10):
+    """
+    Simulated Neural ODE forward solver (Euler method).
+    z(t+dt) = z(t) + f(z) * dt
+    """
+    dt = (t_span[1] - t_span[0]) / steps
+    z = z0
+    for _ in range(steps):
+        # A mock f(z) = -0.5 * z
+        z = z - 0.5 * z * dt
+    return z
+
+
+@vjp_rule(func=neural_ode_solve)
+def _vjp_neural_ode_solve(g, z0, t_span, steps=10):
+    """
+    Simulated Continuous Adjoint Method.
+    Solves the ODE backwards in time to compute gradients in O(1) memory.
+    """
+    dt = (t_span[1] - t_span[0]) / steps
+    a = g
+    for _ in range(steps):
+        # da/dt = -a * df/dz = -a * (-0.5) = 0.5 * a, solve backward
+        a = a - 0.5 * a * dt
+    return (a, None, None)
+
+
+def _s4_forward_cache(u, A, B, C):
+    """Run S4 state space forward and return (y_seq, x_seq) for VJP."""
+    batch, seq_len, d_in = u.shape
+    d_model = A.shape[-1]
+    d_out = C.shape[-1]
+
+    # Vectorized pre-allocation
+    x_prev = backend.zeros((batch, d_model), dtype=u.dtype)
+    x_seq = backend.zeros((batch, seq_len, d_model), dtype=u.dtype)
+    y_seq = backend.zeros((batch, seq_len, d_out), dtype=u.dtype)
+
+    for t in range(seq_len):
+        x_curr = backend.matmul(x_prev, A) + backend.matmul(u[:, t, :], B)
+        x_seq[:, t, :] = x_curr
+        y_seq[:, t, :] = backend.matmul(x_curr, C)
+        x_prev = x_curr
+
+    return y_seq, x_seq
+
+
+def s4_scan(u, A, B, C):
+    """
+    Simulated S4 sequential scan forward pass.
+    y_t = x_t @ C,  x_t = x_{t-1} @ A + u_t @ B
+    """
+    y_seq, _ = _s4_forward_cache(u, A, B, C)
+    return y_seq
+
+
+@vjp_rule(func=s4_scan)
+def _vjp_s4_scan(g, u, A, B, C):
+    """
+    S4 VJP returning exact gradients for (u, A, B, C).
+    Propagates the adjoint state backward through the linear dynamical system.
+    """
+    y_seq, x_seq = _s4_forward_cache(u, A, B, C)
+    batch, seq_len, d_in = u.shape
+    d_model = A.shape[-1]
+
+    gx = backend.zeros((batch, d_model), dtype=g.dtype)
+    du = backend.zeros_like(u)
+    dA = backend.zeros_like(A)
+    dB = backend.zeros_like(B)
+    dC = backend.zeros_like(C)
+
+    # Completely vectorized batched matmuls inside the adjoint reverse sweep
+    for t in range(seq_len - 1, -1, -1):
+        g_y_t = g[:, t, :]
+        x_t = x_seq[:, t, :]
+        x_prev = x_seq[:, t - 1, :] if t > 0 else backend.zeros_like(x_t)
+
+        dC += backend.matmul(x_t.T, g_y_t)
+
+        gx = gx + backend.matmul(g_y_t, C.T)
+        du[:, t, :] = backend.matmul(gx, B.T)
+        dB += backend.matmul(u[:, t, :].T, gx)
+        dA += backend.matmul(x_prev.T, gx)
+        gx = backend.matmul(gx, A.T)
+
+    return (du, dA, dB, dC)
+
+
+# ---------------------------------------------------------------------------
+# 8. Fast Fourier Transforms (FFT, IFFT, FFTN, IFFTN)
+# ---------------------------------------------------------------------------
+
+import math
+
+
+def _fft_norm_scale(norm, n, is_forward):
+    if norm is None or norm == "backward":
+        return n if is_forward else (1.0 / n)
+    elif norm == "ortho":
+        return 1.0
+    elif norm == "forward":
+        return (1.0 / n) if is_forward else n
+    raise ValueError(f"Unknown norm: {norm}")
+
+
+def _slice_to_original(gx, orig_shape, axes):
+    # If the padded output is strictly larger than the input, slice the gradient back down
+    slices = [slice(None)] * gx.ndim
+    for ax in axes:
+        slices[ax] = slice(0, orig_shape[ax])
+    return gx[tuple(slices)]
+
+
+@vjp_rule(func=backend.scipy.fft.fft)
+def _vjp_fft(g, x, n=None, axis=-1, norm=None):
+    out_n = x.shape[axis] if n is None else n
+    scale = _fft_norm_scale(norm, out_n, is_forward=True)
+    gx = scale * backend.scipy.fft.ifft(g, n=out_n, axis=axis, norm=norm)
+    if n is not None and n > x.shape[axis]:
+        gx = _slice_to_original(gx, x.shape, [axis])
+    return (gx,)
+
+
+@vjp_rule(func=backend.scipy.fft.ifft)
+def _vjp_ifft(g, x, n=None, axis=-1, norm=None):
+    out_n = x.shape[axis] if n is None else n
+    scale = _fft_norm_scale(norm, out_n, is_forward=False)
+    gx = scale * backend.scipy.fft.fft(g, n=out_n, axis=axis, norm=norm)
+    if n is not None and n > x.shape[axis]:
+        gx = _slice_to_original(gx, x.shape, [axis])
+    return (gx,)
+
+
+@vjp_rule(func=backend.scipy.fft.fftn)
+def _vjp_fftn(g, x, s=None, axes=None, norm=None):
+    if axes is None:
+        axes = tuple(range(x.ndim))
+    if s is None:
+        s = [x.shape[a] for a in axes]
+    out_n = int(math.prod(s))
+    scale = _fft_norm_scale(norm, out_n, is_forward=True)
+    gx = scale * backend.scipy.fft.ifftn(g, s=s, axes=axes, norm=norm)
+    if any(sz > x.shape[ax] for sz, ax in zip(s, axes)):
+        gx = _slice_to_original(gx, x.shape, axes)
+    return (gx,)
+
+
+@vjp_rule(func=backend.scipy.fft.ifftn)
+def _vjp_ifftn(g, x, s=None, axes=None, norm=None):
+    if axes is None:
+        axes = tuple(range(x.ndim))
+    if s is None:
+        s = [x.shape[a] for a in axes]
+    out_n = int(math.prod(s))
+    scale = _fft_norm_scale(norm, out_n, is_forward=False)
+    gx = scale * backend.scipy.fft.fftn(g, s=s, axes=axes, norm=norm)
+    if any(sz > x.shape[ax] for sz, ax in zip(s, axes)):
+        gx = _slice_to_original(gx, x.shape, axes)
+    return (gx,)

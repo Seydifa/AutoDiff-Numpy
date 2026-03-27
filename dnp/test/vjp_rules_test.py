@@ -12,6 +12,7 @@ import pytest
 import numpy as np
 
 # Local imports
+from dnp.core.backend import backend
 from dnp.core.vjp_rules import (
     VJP_RULES,
     EPSILON,
@@ -24,9 +25,15 @@ from dnp.core.vjp_rules import (
     swish,
     gelu,
     softmax,
+    _reshape,
     conv2d,
     rot180,
     conv2d_full,
+    rope,
+    flash_attention,
+    sinkhorn,
+    neural_ode_solve,
+    s4_scan,
 )
 
 close = lambda a, b: np.allclose(a, b, atol=1e-5)
@@ -300,7 +307,7 @@ class TestVJPShapeOps:
     def test_reshape(self):
         x = np.random.randn(3, 4)
         g = np.random.randn(12)
-        (gx,) = VJP_RULES[np.reshape](g, x, (12,))
+        (gx,) = VJP_RULES[_reshape](g, x, (12,))
         assert gx.shape == (3, 4)
 
     def test_transpose_2d(self):
@@ -384,3 +391,112 @@ class TestVJPNNOps:
         gx, gw = VJP_RULES[conv2d](g, x, w, mode="full")
         assert gx.shape == (5, 5)
         assert gw.shape == (3, 3)
+
+
+class TestVJPAdvancedOps:
+    def test_rope_vjp_shape_and_reversibility(self):
+        batch, seq_len, dim = 2, 5, 8
+        x = np.random.randn(batch, seq_len, dim)
+        cos_freqs = np.random.randn(batch, seq_len, dim // 2)
+        sin_freqs = np.random.randn(batch, seq_len, dim // 2)
+        g = np.random.randn(batch, seq_len, dim)
+        
+        gx, gcos, gsin = VJP_RULES[rope](g, x, cos_freqs, sin_freqs)
+        
+        assert gx.shape == x.shape
+        assert gcos is None
+        assert gsin is None
+        # Forward rope with positive angle, backward is negative angle.
+        # Roping g with negative angle should equal gx.
+        fwd_rope = rope(g, cos_freqs, -sin_freqs)
+        assert close(gx, fwd_rope)
+
+    def test_flash_attention_vjp_shapes(self):
+        B, N, M, d_k, d_v = 2, 5, 5, 4, 8
+        Q = np.random.randn(B, N, d_k)
+        K = np.random.randn(B, M, d_k)
+        V = np.random.randn(B, M, d_v)
+        g_out = np.random.randn(B, N, d_v)
+        
+        dQ, dK, dV, _ = VJP_RULES[flash_attention](g_out, Q, K, V, mask=None)
+        
+        assert dQ.shape == Q.shape
+        assert dK.shape == K.shape
+        assert dV.shape == V.shape
+
+    def test_sinkhorn_vjp_shapes(self):
+        B, N, M = 2, 10, 10
+        a = np.ones((B, N)) / N
+        b = np.ones((B, M)) / M
+        cost_M = np.random.randn(B, N, M)
+        g_P = np.random.randn(B, N, M)
+        reg = 0.1
+        
+        da, db, dM, dreg, _ = VJP_RULES[sinkhorn](g_P, a, b, cost_M, reg, 5)
+        
+        assert da is None
+        assert db is None
+        assert dM.shape == cost_M.shape
+        
+    def test_neural_ode_vjp_shapes(self):
+        z0 = np.random.randn(3, 4)
+        t_span = (0.0, 1.0)
+        g_z = np.random.randn(3, 4)
+        
+        dz0, dt, dstep = VJP_RULES[neural_ode_solve](g_z, z0, t_span, 5)
+        
+        assert dz0.shape == z0.shape
+        assert dt is None
+        
+    def test_s4_scan_vjp_shapes(self):
+        batch, seq_len, d_in, d_model, d_out = 2, 5, 3, 4, 6
+        u = np.random.randn(batch, seq_len, d_in)
+        A = np.random.randn(d_model, d_model)
+        B = np.random.randn(d_in, d_model)
+        C = np.random.randn(d_model, d_out)
+        g_y = np.random.randn(batch, seq_len, d_out)
+        
+        du, dA, dB, dC = VJP_RULES[s4_scan](g_y, u, A, B, C)
+        
+        assert du.shape == u.shape
+        assert dB.shape == B.shape
+        assert dC.shape == C.shape
+
+    def test_fft_vjp_shapes_and_values(self):
+        # 1D complex input
+        x = np.random.randn(5) + 1j * np.random.randn(5)
+        g = np.random.randn(5) + 1j * np.random.randn(5)
+        n = 5
+        
+        gx, = VJP_RULES[backend.scipy.fft.fft](g, x)
+        assert gx.shape == x.shape
+        # Check vjp(fft) == n * ifft(g)
+        assert close(gx, n * np.fft.ifft(g))
+
+    def test_ifft_vjp_shapes_and_values(self):
+        x = np.random.randn(4) + 1j * np.random.randn(4)
+        g = np.random.randn(4) + 1j * np.random.randn(4)
+        n = 4
+        
+        gx, = VJP_RULES[backend.scipy.fft.ifft](g, x)
+        assert gx.shape == x.shape
+        assert close(gx, (1.0 / n) * np.fft.fft(g))
+
+    def test_fftn_vjp_shapes(self):
+        x = np.random.randn(3, 4) + 1j * np.random.randn(3, 4)
+        g = np.random.randn(3, 4) + 1j * np.random.randn(3, 4)
+        n = 12
+        
+        gx, = VJP_RULES[backend.scipy.fft.fftn](g, x)
+        assert gx.shape == x.shape
+        assert close(gx, n * np.fft.ifftn(g))
+
+    def test_ifftn_vjp_shapes(self):
+        x = np.random.randn(2, 2, 2) + 1j * np.random.randn(2, 2, 2)
+        g = np.random.randn(2, 2, 2) + 1j * np.random.randn(2, 2, 2)
+        n = 8
+        
+        gx, = VJP_RULES[backend.scipy.fft.ifftn](g, x)
+        assert gx.shape == x.shape
+        assert close(gx, (1.0 / n) * np.fft.fftn(g))
+

@@ -21,6 +21,7 @@ import time
 from typing import Callable, Iterable, List, Optional, Sequence
 
 import numpy as np
+from dnp.core.backend import as_numpy
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +376,7 @@ class Trainer:
                 self.optimizer.step()
                 session.reset()
 
-                batch_loss = float(loss.data)
+                batch_loss = float(loss)
                 epoch_loss += batch_loss
                 n_batches += 1
 
@@ -436,7 +437,7 @@ class Trainer:
                 y_pred = self.model(bx_t)
                 loss = self.loss_fn(y_pred, by_t)
 
-            total_loss += float(loss.data)
+            total_loss += float(loss)
             n_batches += 1
 
         return total_loss / max(n_batches, 1)
@@ -463,8 +464,7 @@ class Trainer:
             bx = x[batch_start : batch_start + batch_size]
             with session.no_grad():
                 y_pred = self.model(Tensor(bx, name="x"))
-            out = y_pred.data if hasattr(y_pred, "data") else np.array(y_pred)
-            outputs.append(out)
+            outputs.append(as_numpy(y_pred.data))
 
         return np.concatenate(outputs, axis=0)
 
@@ -518,7 +518,7 @@ class History:
 
 def _copy_weights(model) -> list:
     """Return a deep copy of all parameter arrays."""
-    return [p.data.copy() for p in model.parameters()]
+    return [as_numpy(p.data).copy() for p in model.parameters()]
 
 
 def _restore_weights(model, weights: list) -> None:
@@ -530,12 +530,14 @@ def _restore_weights(model, weights: list) -> None:
 def _save_model(model, path: str) -> None:
     """Save model to *path* as ``.pkl`` or ``.npz``."""
     if path.endswith(".npz"):
-        arrays = {f"param_{i}": p.data for i, p in enumerate(model.parameters())}
+        arrays = {
+            f"param_{i}": as_numpy(p.data) for i, p in enumerate(model.parameters())
+        }
         np.savez(path, **arrays)
     else:
         with open(path, "wb") as fh:
             pickle.dump(
-                {"weights": [p.data for p in model.parameters()]},
+                {"weights": [as_numpy(p.data) for p in model.parameters()]},
                 fh,
                 protocol=pickle.HIGHEST_PROTOCOL,
             )

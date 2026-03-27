@@ -28,9 +28,6 @@ v3 additions
 import functools
 from contextlib import contextmanager
 
-# Third-party
-import numpy as np
-
 # Optional visualization support
 try:
     import matplotlib.pyplot as plt
@@ -69,7 +66,6 @@ def graph_fn(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         from .tensor import Tensor  # deferred — avoids circular import
-        from .backend import get_xp
 
         def _to_tensor(v):
             if isinstance(v, Tensor):
@@ -79,9 +75,7 @@ def graph_fn(func):
             # (axis, shape, keepdims, p, training, …) are intentionally left
             # as-is so ops like expand_dims(x, 0) and dropout(x, p=0.5) work.
             if hasattr(v, "shape") and hasattr(v, "dtype"):
-                xp = get_xp(v)
-                if xp is not None:
-                    return Tensor(v, name=f"{func.__name__}_in")
+                return Tensor(v, name=f"{func.__name__}_in")
             return v  # leave int, float, bool, tuple, str, etc. unchanged
 
         new_args = tuple(_to_tensor(a) for a in args)

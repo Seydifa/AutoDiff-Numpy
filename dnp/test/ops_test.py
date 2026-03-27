@@ -2,9 +2,9 @@
 ops_test.py
 ===========
 Tests for dnp/core/ops.py:
-  - Ops class behaviour (forward call, vpj method, repr)
+  - Ops class behaviour (forward call, vjp method, repr)
   - Forward pass of every Ops instance
-  - vpj() delegation matches VJP_RULES
+  - vjp() delegation matches VJP_RULES
   - All Ops instances exported from dnp.core
 """
 
@@ -60,6 +60,10 @@ from dnp.core.ops import (
     swish,
     gelu,
     softmax,
+    fft,
+    ifft,
+    fftn,
+    ifftn,
 )
 from dnp.core.vjp_rules import VJP_RULES
 
@@ -77,9 +81,9 @@ class TestOpsClass:
         result = op(np.array([1.0]), np.array([2.0]))
         assert close(result, np.array([3.0]))
 
-    def test_vpj_delegation(self):
+    def test_vjp_delegation(self):
         op = Ops(np.add, name="test_add")
-        gx, gy = op.vpj(np.ones(2), np.array([1.0, 2.0]), np.array([3.0, 4.0]))
+        gx, gy = op.vjp(np.ones(2), np.array([1.0, 2.0]), np.array([3.0, 4.0]))
         assert close(gx, np.ones(2)) and close(gy, np.ones(2))
 
     def test_name_attribute(self):
@@ -224,41 +228,57 @@ class TestForwardPass:
         w = np.random.randn(3, 3)
         assert conv2d(x, w, mode="valid").shape == (3, 3)
 
+    def test_fft(self):
+        x_c = np.random.randn(4) + 1j * np.random.randn(4)
+        assert close(fft(x_c).data, np.fft.fft(x_c))
+
+    def test_ifft(self):
+        x_c = np.random.randn(4) + 1j * np.random.randn(4)
+        assert close(ifft(x_c).data, np.fft.ifft(x_c))
+
+    def test_fftn(self):
+        x_c = np.random.randn(2, 2) + 1j * np.random.randn(2, 2)
+        assert close(fftn(x_c).data, np.fft.fftn(x_c))
+
+    def test_ifftn(self):
+        x_c = np.random.randn(2, 2) + 1j * np.random.randn(2, 2)
+        assert close(ifftn(x_c).data, np.fft.ifftn(x_c))
+
 
 # ===========================================================================
-# VJP delegation — Ops.vpj delegates correctly to VJP_RULES
+# VJP delegation — Ops.vjp bound at init, matches VJP_RULES result
 # ===========================================================================
 
 
-class TestVPJDelegation:
-    """Ensuring op.vpj() returns identical results to VJP_RULES lookup."""
+class TestVJPDelegation:
+    """Ensuring op.vjp() calls the VJP bound at init — matches VJP_RULES result."""
 
     g = np.ones(3)
     x = np.array([1.0, 2.0, 3.0])
     y = np.array([4.0, 5.0, 6.0])
 
     def _check(self, op, np_key, *args):
-        via_op = op.vpj(*args)
+        via_op = op.vjp(*args)
         via_rules = VJP_RULES[np_key](*args)
         for a, b in zip(via_op, via_rules):
             assert close(a, b)
 
-    def test_add_vpj(self):
+    def test_add_vjp(self):
         self._check(add, np.add, self.g, self.x, self.y)
 
-    def test_subtract_vpj(self):
+    def test_subtract_vjp(self):
         self._check(subtract, np.subtract, self.g, self.x, self.y)
 
-    def test_multiply_vpj(self):
+    def test_multiply_vjp(self):
         self._check(multiply, np.multiply, self.g, self.x, self.y)
 
-    def test_exp_vpj(self):
+    def test_exp_vjp(self):
         self._check(exp, np.exp, self.g, self.x)
 
-    def test_log_vpj(self):
+    def test_log_vjp(self):
         self._check(log, np.log, self.g, self.x)
 
-    def test_sum_vpj(self):
+    def test_sum_vjp(self):
         self._check(sum, np.sum, np.array(1.0), self.x)
 
 
@@ -317,6 +337,10 @@ class TestCoreExports:
             "swish",
             "gelu",
             "softmax",
+            "fft",
+            "ifft",
+            "fftn",
+            "ifftn",
         ]
         for name in ops_list:
             assert hasattr(core, name), f"dnp.core missing: {name}"

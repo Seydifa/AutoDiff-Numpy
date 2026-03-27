@@ -1,12 +1,9 @@
-# Local imports: Backward-compatibility re-export from core/layers.py
-# All layer implementations have been consolidated in dnp/core/layers.py
-from dnp.core.layers import (
-    Module,
-    Sequential,
-    Linear,
-    Conv2d,
-    MaxPool2d,
-    AvgPool2d,
+"""
+Neural Network Layers.
+"""
+
+from .base import Module, Sequential
+from .activations import (
     ReLU,
     Sigmoid,
     Tanh,
@@ -16,36 +13,67 @@ from dnp.core.layers import (
     Softplus,
     Swish,
     GELU,
-    BatchNorm1d,
-    BatchNorm2d,
-    LayerNorm,
-    Embedding,
-    Dropout,
+)
+from .conv import Conv1d, Conv2d
+from .linear import Linear
+from .pooling import (
+    MaxPool2d,
+    AvgPool2d,
+    GlobalAvgPool1d,
+    GlobalMaxPool1d,
+    GlobalAvgPool2d,
+    GlobalMaxPool2d,
+)
+from .normalization import BatchNorm1d, BatchNorm2d, LayerNorm
+from .embedding import Embedding
+from .regularization import Dropout
+from .loss import (
+    CrossEntropyLoss,
+    MSELoss,
+    MAELoss,
+    L1Loss,
+    HuberLoss,
+    SmoothL1Loss,
+    LogCoshLoss,
+    BCELoss,
+    BCEWithLogitsLoss,
+    NLLLoss,
+    KLDivLoss,
+    FocalLoss,
+    HingeLoss,
+    SquaredHingeLoss,
+)
+from .utils import Flatten, Reshape, ExpandDims, Squeeze, Repeat, Concatenate, Stack
+from .attention import (
     ScaledDotProductAttention,
     MultiHeadAttention,
     SelfAttention,
     PositionalEncoding,
     FeedForward,
     TransformerEncoderLayer,
-    Flatten,
-    CrossEntropyLoss,
-    MSELoss,
-    BCELoss,
-    BCEWithLogitsLoss,
+    FlashAttention,
+    RotaryPositionalEncoding,
 )
+from .advanced import SinkhornTransport, NeuralODE, S4Layer, RNN, LSTM, GRU
+
 
 __all__ = [
-    # Base classes
+    # Base
     "Module",
     "Sequential",
-    # Linear layers
+    # Dense
     "Linear",
-    # Convolutional layers
+    # Conv
+    "Conv1d",
     "Conv2d",
-    # Pooling layers
+    # Pool
     "MaxPool2d",
     "AvgPool2d",
-    # Activation layers
+    "GlobalAvgPool1d",
+    "GlobalMaxPool1d",
+    "GlobalAvgPool2d",
+    "GlobalMaxPool2d",
+    # Activations
     "ReLU",
     "Sigmoid",
     "Tanh",
@@ -55,27 +83,51 @@ __all__ = [
     "Softplus",
     "Swish",
     "GELU",
-    # Normalization layers
+    # Norm
     "BatchNorm1d",
     "BatchNorm2d",
     "LayerNorm",
     # Embedding
     "Embedding",
-    # Regularization layers
+    # Regularization
     "Dropout",
-    # Attention layers
+    # Loss
+    "CrossEntropyLoss",
+    "MSELoss",
+    "MAELoss",
+    "L1Loss",
+    "HuberLoss",
+    "SmoothL1Loss",
+    "LogCoshLoss",
+    "BCELoss",
+    "BCEWithLogitsLoss",
+    "NLLLoss",
+    "KLDivLoss",
+    "FocalLoss",
+    "HingeLoss",
+    "SquaredHingeLoss",
+    # Utils
+    "Flatten",
+    "Reshape",
+    "ExpandDims",
+    "Squeeze",
+    "Repeat",
+    "Concatenate",
+    "Stack",
+    # Attention / Transformers
     "ScaledDotProductAttention",
     "MultiHeadAttention",
     "SelfAttention",
-    # Transformer building blocks
     "PositionalEncoding",
     "FeedForward",
     "TransformerEncoderLayer",
-    # Loss layers
-    "CrossEntropyLoss",
-    "MSELoss",
-    "BCELoss",
-    "BCEWithLogitsLoss",
-    # Utility layers
-    "Flatten",
+    "FlashAttention",
+    "RotaryPositionalEncoding",
+    # Advanced
+    "SinkhornTransport",
+    "NeuralODE",
+    "S4Layer",
+    "RNN",
+    "LSTM",
+    "GRU",
 ]

@@ -69,12 +69,12 @@ def main():
     print("\n3. Setting up training components...")
 
     criterion = dnp.BCELoss()
-    optimizer = dnp.Adam(model.parameters(), lr=0.05)
-    early_stop = dnp.EarlyStopping(monitor="loss", patience=50, verbose=True)
+    optimizer = dnp.Adam(model.parameters(), lr=0.01)
+    early_stop = dnp.EarlyStopping(monitor="loss", patience=100, verbose=True)
 
     print(f"  Loss:      BCELoss")
-    print(f"  Optimizer: Adam (lr=0.05)")
-    print(f"  Callback:  EarlyStopping (patience=50)")
+    print(f"  Optimizer: Adam (lr=0.01)")
+    print(f"  Callback:  EarlyStopping (patience=100)")
 
     # Capture computation graph before training starts
     out_path = (

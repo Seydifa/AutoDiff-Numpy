@@ -183,27 +183,19 @@ class TestBackward:
         assert close(t.grad, np.ones(2))
 
     def test_add_backward(self, isolated_session):
+        from dnp.core.ops import add
         x = _Tensor([2.0, 3.0], name="x")
         y = _Tensor([4.0, 5.0], name="y")
-        result = _Tensor(
-            np.add(x, y),
-            parents=[x, y],
-            op_func=np.add,
-            name="add_result",
-        )
+        result = add(x, y)
         result.backward()
         assert close(x.grad, np.ones(2))
         assert close(y.grad, np.ones(2))
 
     def test_multiply_backward(self, isolated_session):
+        from dnp.core.ops import multiply
         x = _Tensor([2.0, 3.0], name="x")
         y = _Tensor([4.0, 5.0], name="y")
-        result = _Tensor(
-            np.multiply(x, y),
-            parents=[x, y],
-            op_func=np.multiply,
-            name="mul_result",
-        )
+        result = multiply(x, y)
         result.backward()
         # d/dx (x*y) = y,  d/dy (x*y) = x
         assert close(x.grad, np.array([4.0, 5.0]))
@@ -216,40 +208,28 @@ class TestBackward:
         assert close(t.grad, np.array([5.0]))
 
     def test_chain_rule_exp_then_sum(self, isolated_session):
+        from dnp.core.ops import sum, exp
         """d/dx sum(exp(x)) = exp(x)."""
         x = _Tensor([0.0, 1.0], name="x")
-        exp_x = _Tensor(
-            np.exp(np.asarray(x)), parents=[x], op_func=np.exp, name="exp_x"
-        )
-        total = _Tensor(
-            np.sum(np.asarray(exp_x)),
-            parents=[exp_x],
-            op_func=np.sum,
-            name="sum",
-        )
+        exp_x = exp(x)
+        total = sum(exp_x)
         total.backward()
         assert close(x.grad, np.exp(np.array([0.0, 1.0])))
 
     def test_neg_backward(self, isolated_session):
+        from dnp.core.ops import negative
         x = _Tensor([3.0, -1.0], name="x")
-        result = _Tensor(
-            np.negative(np.asarray(x)), parents=[x], op_func=np.negative, name="neg"
-        )
+        result = negative(x)
         result.backward()
         assert close(x.grad, np.array([-1.0, -1.0]))
 
     def test_no_grad_skips_registration(self, isolated_session):
+        from dnp.core.ops import negative
         """When a Tensor is created inside no_grad, no edge is registered,
         so backward() on it does NOT propagate gradients to its parents."""
         x = _Tensor([1.0], name="x")
         with isolated_session.no_grad():
-            # Use a unary op so the VJP receives the right number of args
-            result = _Tensor(
-                np.negative(np.asarray(x)),
-                parents=[x],
-                op_func=np.negative,
-                name="r",
-            )
+            result = negative(x)
         # result.id is None (not in graph), so no edge x→result was ever added
         # backward() still has op_func set, but the parents list was assigned:
         # this test verifies the design decision that x gets NO gradient

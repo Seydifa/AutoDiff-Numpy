@@ -1,8 +1,8 @@
 # Local imports: Core modules
 from . import ops, core
 
-# Dtype control — primary public API
-from .core.backend import set_dtype, get_dtype
+# Dtype and device control — primary public API
+from .core.backend import set_dtype, get_dtype, set_device
 
 # Tensor and session — required for any computation
 from .core.tensor import Tensor
@@ -16,6 +16,10 @@ from .layers import (
     Conv2d,
     MaxPool2d,
     AvgPool2d,
+    GlobalAvgPool1d,
+    GlobalMaxPool1d,
+    GlobalAvgPool2d,
+    GlobalMaxPool2d,
     ReLU,
     Sigmoid,
     Tanh,
@@ -37,10 +41,26 @@ from .layers import (
     FeedForward,
     TransformerEncoderLayer,
     Flatten,
+    Reshape,
+    ExpandDims,
+    Squeeze,
+    Repeat,
+    Concatenate,
+    Stack,
     CrossEntropyLoss,
     MSELoss,
+    MAELoss,
+    L1Loss,
+    HuberLoss,
+    SmoothL1Loss,
+    LogCoshLoss,
     BCELoss,
     BCEWithLogitsLoss,
+    NLLLoss,
+    KLDivLoss,
+    FocalLoss,
+    HingeLoss,
+    SquaredHingeLoss,
 )
 
 # Local imports: Optimizer classes available at top level
@@ -91,6 +111,10 @@ __all__ = [
     # Pooling layers
     "MaxPool2d",
     "AvgPool2d",
+    "GlobalAvgPool1d",
+    "GlobalMaxPool1d",
+    "GlobalAvgPool2d",
+    "GlobalMaxPool2d",
     # Activation layers
     "ReLU",
     "Sigmoid",
@@ -119,11 +143,27 @@ __all__ = [
     "TransformerEncoderLayer",
     # Utility layers
     "Flatten",
+    "Reshape",
+    "ExpandDims",
+    "Squeeze",
+    "Repeat",
+    "Concatenate",
+    "Stack",
     # Loss functions
     "CrossEntropyLoss",
     "MSELoss",
+    "MAELoss",
+    "L1Loss",
+    "HuberLoss",
+    "SmoothL1Loss",
+    "LogCoshLoss",
     "BCELoss",
     "BCEWithLogitsLoss",
+    "NLLLoss",
+    "KLDivLoss",
+    "FocalLoss",
+    "HingeLoss",
+    "SquaredHingeLoss",
     # Optimization algorithms
     "Optimizer",
     "SGD",
