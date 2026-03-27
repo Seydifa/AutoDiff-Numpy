@@ -70,7 +70,7 @@ class _DeviceStats:
 
     def total(self) -> int:
         """Return the total number of operations recorded."""
-        return sum(self.counts.values())
+        return self.counts.get("cpu", 0) + self.counts.get("cuda", 0)
 
     def percentage(self, device: str) -> float:
         """Return the percentage of operations that ran on *device*.
