@@ -17,6 +17,7 @@ operation, define a forward function and decorate its backward with::
 """
 
 # Third-party libraries
+import numpy as _np
 from .backend import backend, safe_eps, get_dtype
 from .tensor import Tensor
 from .session import session
@@ -773,7 +774,7 @@ def _vjp_transpose(g, x, axes=None):
     # and cp.argsort(tuple) fails on some CuPy versions.  The result is passed
     # back as a plain list so both NumPy and CuPy accept it for transpose.
     return (
-        backend.transpose(g, backend.argsort(list(axes)).tolist())
+        backend.transpose(g, _np.argsort(list(axes)).tolist())
         if axes is not None
         else g.T,
     )
