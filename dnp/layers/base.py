@@ -1,6 +1,7 @@
 """
 Base module classes and utilities.
 """
+
 from dnp.core.backend import backend, get_dtype
 from dnp.core.tensor import Tensor
 
@@ -100,7 +101,8 @@ class Module:
 
     def zero_grad(self):
         for p in self.parameters():
-            p.grad.fill(0.0)
+            if p.grad is not None:
+                p.grad.fill(0.0)
 
     def cpu(self):
         for name, param in self._parameters.items():
@@ -115,6 +117,10 @@ class Module:
         for name, module in self._modules.items():
             module.cuda()
         return self
+
+    def to(self, device: str):
+        """Move the module and all its parameters to *device* ('cpu' or 'cuda')."""
+        return self.cuda() if device == "cuda" else self.cpu()
 
     def eval(self):
         self.training = False
@@ -132,7 +138,55 @@ class Module:
         return self.forward(*args, **kwargs)
 
     def forward(self, *args, **kwargs):
-        raise NotImplementedError("The forward() method must be implemented in subclasses.")
+        raise NotImplementedError(
+            "The forward() method must be implemented in subclasses."
+        )
+
+    def num_parameters(self, trainable_only: bool = True) -> int:
+        """Return the total number of scalar parameters in this module.
+
+        Parameters
+        ----------
+        trainable_only : bool
+            When ``True`` (default) count only trainable parameters.
+            Pass ``False`` to include non-trainable tensors as well.
+        """
+        params = dict(self._parameters)
+        if not trainable_only:
+            params.update(self._nontrainable)
+        count = sum(p.size for p in params.values())
+        for module in self._modules.values():
+            count += module.num_parameters(trainable_only)
+        return count
+
+    def state_dict(self) -> dict:
+        """Return an ordered dict mapping parameter names to numpy arrays."""
+        from dnp.core.backend import as_numpy
+
+        return {
+            name: as_numpy(param.data).copy() for name, param in self.named_parameters()
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Load parameter values from *state* (a dict from :meth:`state_dict`).
+
+        Raises ``KeyError`` if a parameter name present in the model is missing
+        from *state*, preventing silent shape mismatches.
+        """
+        for name, param in self.named_parameters():
+            if name not in state:
+                raise KeyError(
+                    f"load_state_dict: missing key '{name}' in the provided state dict."
+                )
+            param.data[...] = state[name]
+
+    @classmethod
+    def reset_counters(cls) -> None:
+        """Reset all module instance counters to zero.
+
+        Useful in test suites to get deterministic module names across tests.
+        """
+        cls._instance_counters.clear()
 
     def __repr__(self):
         lines = [f"{self.__class__.__name__}("]

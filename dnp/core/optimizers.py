@@ -83,10 +83,10 @@ class Optimizer:
         param[...] = value
 
     def _iter_params_with_grad(self):
-        for param in self.parameters:
+        for i, param in enumerate(self.parameters):
             grad = getattr(param, "grad", None)
             if grad is not None:
-                yield param, id(param), grad
+                yield param, i, grad
 
     def zero_grad(self) -> None:
         """
@@ -273,10 +273,10 @@ class Adam(Optimizer):
         # identify each parameter tensor.
         # State is allocated on the same device as the parameter.
         self.m: Dict[int, Any] = {
-            id(p): self._zeros_like_param(p) for p in self.parameters
+            i: self._zeros_like_param(p) for i, p in enumerate(self.parameters)
         }
         self.v: Dict[int, Any] = {
-            id(p): self._zeros_like_param(p) for p in self.parameters
+            i: self._zeros_like_param(p) for i, p in enumerate(self.parameters)
         }
 
     def step(self) -> None:
@@ -392,7 +392,7 @@ class Momentum(Optimizer):
         self.dampening = dampening
         self.nesterov = nesterov
         self.velocity: Dict[int, Any] = {
-            id(p): self._zeros_like_param(p) for p in self.parameters
+            i: self._zeros_like_param(p) for i, p in enumerate(self.parameters)
         }
 
     def step(self) -> None:
@@ -492,11 +492,11 @@ class RMSprop(Optimizer):
         self.centered = centered
 
         self.sq_avg: Dict[int, Any] = {
-            id(p): self._zeros_like_param(p) for p in self.parameters
+            i: self._zeros_like_param(p) for i, p in enumerate(self.parameters)
         }
         if centered:
             self.buffer: Dict[int, Any] = {
-                id(p): self._zeros_like_param(p) for p in self.parameters
+                i: self._zeros_like_param(p) for i, p in enumerate(self.parameters)
             }
 
     def step(self) -> None:
@@ -596,7 +596,7 @@ class Adagrad(Optimizer):
         super().__init__(parameters, lr)
         self.epsilon = epsilon
         self.sq_sum: Dict[int, Any] = {
-            id(p): self._zeros_like_param(p) for p in self.parameters
+            i: self._zeros_like_param(p) for i, p in enumerate(self.parameters)
         }
 
     def step(self) -> None:
@@ -710,10 +710,10 @@ class AdamW(Optimizer):
         self.t = 0
 
         self.m: Dict[int, Any] = {
-            id(p): self._zeros_like_param(p) for p in self.parameters
+            i: self._zeros_like_param(p) for i, p in enumerate(self.parameters)
         }
         self.v: Dict[int, Any] = {
-            id(p): self._zeros_like_param(p) for p in self.parameters
+            i: self._zeros_like_param(p) for i, p in enumerate(self.parameters)
         }
 
     def step(self) -> None:

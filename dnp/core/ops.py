@@ -59,6 +59,7 @@ class _DeviceStats:
 
     def __init__(self):
         self.counts: dict = {"cpu": 0, "cuda": 0}
+        self.enabled: bool = False  # opt-in: set True to track per-op device counts
 
     def record(self, device: str) -> None:
         """Increment the counter for *device* by one."""
@@ -127,6 +128,18 @@ class Ops:
         self.name = name or getattr(func, "__name__", repr(func))
         # Bind the VJP once — look up from the registry only as a fallback.
         self._vjp = vjp_fn if vjp_fn is not None else VJP_RULES.get(func)
+        # --- B6 fix: detect if func is a direct backend attribute so we can
+        #     resolve it lazily at call time (supports set_device switching).
+        _fn_name = getattr(func, "__name__", None)
+        _mod = object.__getattribute__(backend, "_module")
+        if (
+            _fn_name is not None
+            and hasattr(_mod, _fn_name)
+            and getattr(_mod, _fn_name) is func
+        ):
+            self._backend_op_name = _fn_name  # resolve via backend lazily
+        else:
+            self._backend_op_name = None  # use self.func directly
         # Use the provided kernel call or the default graph-wiring path.
         if kernel_call is not None:
             raw = lambda *a, **kw: kernel_call(self, *a, **kw)  # noqa: E731
@@ -137,12 +150,19 @@ class Ops:
     # ------------------------------------------------------------------
     def _raw_call(self, *args, **kwargs):
         """Default graph-wiring: strip .data → forward → build Tensor node."""
+        # B6: resolve the forward function from the current backend lazily so
+        #     device switching (set_device) takes effect without restarting.
+        forward_fn = (
+            getattr(backend, self._backend_op_name)
+            if self._backend_op_name is not None
+            else self.func
+        )
         args_data = [a.data if isinstance(a, Tensor) else a for a in args]
         kwargs_data = {
             k: (v.data if isinstance(v, Tensor) else v) for k, v in kwargs.items()
         }
 
-        out_data = self.func(*args_data, **kwargs_data)
+        out_data = forward_fn(*args_data, **kwargs_data)
 
         parent_indices = [i for i, a in enumerate(args) if isinstance(a, Tensor)]
         parents = [args[i] for i in parent_indices]
@@ -186,14 +206,10 @@ class Ops:
     # ------------------------------------------------------------------
     def __call__(self, *args, **kwargs):
         result = self._graph_call(*args, **kwargs)
-        # Determine the device from the output and update the global tracker.
-        if isinstance(result, Tensor):
+        # Update the global device tracker only when tracking is enabled.
+        if device_stats.enabled and isinstance(result, Tensor):
             _dev = "cuda" if is_cupy_array(result.data) else "cpu"
-        elif hasattr(result, "dtype"):  # bare numpy / cupy array
-            _dev = "cuda" if is_cupy_array(result) else "cpu"
-        else:
-            _dev = backend.device
-        device_stats.record(_dev)
+            device_stats.record(_dev)
         return result
 
     def __repr__(self):
@@ -397,9 +413,112 @@ batch_norm = Ops(
 )
 
 # ── Recurrent / sequence ──────────────────────────────────────────────────────
-rnn_cell = Ops(rules.rnn_cell, vjp_fn=VJP_RULES[rules.rnn_cell], name="rnn_cell")
-lstm_cell = Ops(rules.lstm_cell, vjp_fn=VJP_RULES[rules.lstm_cell], name="lstm_cell")
-gru_cell = Ops(rules.gru_cell, vjp_fn=VJP_RULES[rules.gru_cell], name="gru_cell")
+# ──── RNN / LSTM / GRU kernel calls (P2: cache forward activations) ──────────
+# Each kernel_call runs the forward cache function once and stores the
+# activations in op_kwargs so the VJP can reuse them without re-running forward.
+
+
+def _unpack(t):
+    """Return raw array from Tensor or pass through."""
+    return t.data if isinstance(t, Tensor) else t
+
+
+def rnn_kernel_call(op, x, Wh, Wx, bh, h0=None):
+    h_seq, h0_used = rules._rnn_forward_cache(
+        _unpack(x), _unpack(Wh), _unpack(Wx), _unpack(bh), _unpack(h0)
+    )
+    parents = [a for a in (x, Wh, Wx, bh) if isinstance(a, Tensor)]
+    if isinstance(h0, Tensor):
+        parents.append(h0)
+    if not parents:
+        return h_seq
+    return Tensor(
+        h_seq,
+        parents=parents,
+        op_func=op,
+        op_kwargs={"h_seq": h_seq, "h0_used": h0_used},
+        name=op.name,
+    )
+
+
+def lstm_kernel_call(op, x, W, b, h0=None, c0=None):
+    h_seq, c_seq, f_seq, i_seq, ct_seq, o_seq, h0_u, c0_u = rules._lstm_forward_cache(
+        _unpack(x), _unpack(W), _unpack(b), _unpack(h0), _unpack(c0)
+    )
+    parents = [a for a in (x, W, b) if isinstance(a, Tensor)]
+    if isinstance(h0, Tensor):
+        parents.append(h0)
+    if isinstance(c0, Tensor):
+        parents.append(c0)
+    if not parents:
+        return h_seq
+    return Tensor(
+        h_seq,
+        parents=parents,
+        op_func=op,
+        op_kwargs={
+            "h_seq": h_seq,
+            "c_seq": c_seq,
+            "f_seq": f_seq,
+            "i_seq": i_seq,
+            "ct_seq": ct_seq,
+            "o_seq": o_seq,
+            "h0_u": h0_u,
+            "c0_u": c0_u,
+        },
+        name=op.name,
+    )
+
+
+def gru_kernel_call(op, x, Wr, Wz, Wh, br, bz, bh, h0=None):
+    h_seq, r_seq, z_seq, ht_seq, h0_u = rules._gru_forward_cache(
+        _unpack(x),
+        _unpack(Wr),
+        _unpack(Wz),
+        _unpack(Wh),
+        _unpack(br),
+        _unpack(bz),
+        _unpack(bh),
+        _unpack(h0),
+    )
+    parents = [a for a in (x, Wr, Wz, Wh, br, bz, bh) if isinstance(a, Tensor)]
+    if isinstance(h0, Tensor):
+        parents.append(h0)
+    if not parents:
+        return h_seq
+    return Tensor(
+        h_seq,
+        parents=parents,
+        op_func=op,
+        op_kwargs={
+            "h_seq": h_seq,
+            "r_seq": r_seq,
+            "z_seq": z_seq,
+            "ht_seq": ht_seq,
+            "h0_u": h0_u,
+        },
+        name=op.name,
+    )
+
+
+rnn_cell = Ops(
+    rules.rnn_cell,
+    vjp_fn=VJP_RULES[rules.rnn_cell],
+    name="rnn_cell",
+    kernel_call=rnn_kernel_call,
+)
+lstm_cell = Ops(
+    rules.lstm_cell,
+    vjp_fn=VJP_RULES[rules.lstm_cell],
+    name="lstm_cell",
+    kernel_call=lstm_kernel_call,
+)
+gru_cell = Ops(
+    rules.gru_cell,
+    vjp_fn=VJP_RULES[rules.gru_cell],
+    name="gru_cell",
+    kernel_call=gru_kernel_call,
+)
 
 # ── Normalization & attention ─────────────────────────────────────────────────
 layer_norm = Ops(
@@ -527,6 +646,99 @@ where = Ops(
     vjp_fn=_where_vjp,  # ops-layer VJP — uses stored condition/flags
     name="where",
     kernel_call=where_kernel_call,
+)
+
+# ---- getitem_kernel_call -------------------------------------------------
+
+
+def getitem_kernel_call(op, x, idx):
+    """getitem: keep idx out of the graph (it's not differentiable).
+
+    graph_fn auto-casts integer numpy arrays to float via Tensor.__init__;
+    we restore integer dtype here so numpy indexing works correctly.
+    """
+    if isinstance(idx, Tensor):
+        _raw = idx.data
+        # Restore integer type if graph_fn coerced an int array to float
+        if hasattr(_raw, "dtype") and (
+            "float" in str(_raw.dtype) or "complex" in str(_raw.dtype)
+        ):
+            idx = _raw.astype(int)
+        else:
+            idx = _raw
+    x_data = x.data if isinstance(x, Tensor) else x
+    out_data = x_data[idx]
+    parents = [x] if isinstance(x, Tensor) else []
+    if not parents:
+        return out_data
+    return Tensor(
+        out_data,
+        parents=parents,
+        op_func=op,
+        op_kwargs={"idx": idx},
+        name=op.name,
+    )
+
+
+getitem = Ops(
+    rules.getitem,
+    vjp_fn=VJP_RULES[rules.getitem],
+    name="getitem",
+    kernel_call=getitem_kernel_call,
+)
+
+
+def setitem_kernel_call(op, x, idx, value):
+    """Differentiable copy-and-set: keeps x, idx, value in the graph.
+
+    idx is extracted raw (not as a Tensor) so numpy indexing works.
+    """
+    if isinstance(idx, Tensor):
+        _raw = idx.data
+        if hasattr(_raw, "dtype") and (
+            "float" in str(_raw.dtype) or "complex" in str(_raw.dtype)
+        ):
+            idx = _raw.astype(int)
+        else:
+            idx = _raw
+
+    x_data = x.data if isinstance(x, Tensor) else x
+    val_data = value.data if isinstance(value, Tensor) else value
+
+    out_data = x_data.copy()
+    out_data[idx] = val_data
+
+    parents = []
+    if isinstance(x, Tensor):
+        parents.append(x)
+    if isinstance(value, Tensor):
+        parents.append(value)
+    if not parents:
+        return out_data
+
+    # Store raw arrays + idx for VJP
+    p_indices = (
+        {0: 0, 2: 1}
+        if len(parents) == 2
+        else ({0: 0} if isinstance(x, Tensor) else {2: 0})
+    )
+    return Tensor(
+        out_data,
+        parents=parents,
+        op_func=op,
+        op_kwargs={
+            "_vjp_args": [x_data, idx, val_data],
+            "_vjp_parent_indices": p_indices,
+        },
+        name=op.name,
+    )
+
+
+setitem = Ops(
+    rules.setitem,
+    vjp_fn=VJP_RULES[rules.setitem],
+    name="setitem",
+    kernel_call=setitem_kernel_call,
 )
 
 gather = Ops(
@@ -714,6 +926,9 @@ __all__ = [
     # regularization / normalization
     "dropout",
     "batch_norm",
+    # indexing
+    "getitem",
+    "setitem",
     # gather / embedding
     "gather",
     "embedding",

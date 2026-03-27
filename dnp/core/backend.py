@@ -57,6 +57,18 @@ import numpy as np
 
 try:
     import scipy as _scipy
+
+    # C3: scipy.fft requires SciPy >= 1.4 (released 2019).
+    # The pyproject.toml pins scipy >= 1.7, so this is defence-in-depth only.
+    _scipy_version = tuple(int(x) for x in _scipy.__version__.split(".")[:2])
+    if _scipy_version < (1, 4):
+        import warnings as _w
+        _w.warn(
+            f"SciPy {_scipy.__version__} detected. dnp.core FFT ops require "
+            "SciPy >= 1.4. Please upgrade: pip install 'scipy>=1.7'",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 except ImportError:  # pragma: no cover
     _scipy = None
 
@@ -67,6 +79,19 @@ is_cuda_available = False
 try:
     import cupy as cp
     import cupyx.scipy as _cupyx_scipy
+
+    # C2: Require CuPy >= 10.0 for cupy.lib.stride_tricks.as_strided support.
+    _cp_version = tuple(int(x) for x in cp.__version__.split(".")[:2])
+    if _cp_version < (10, 0):
+        import warnings as _w
+
+        _w.warn(
+            f"CuPy {cp.__version__} detected. dnp requires CuPy >= 10.0 for "
+            "`cupy.lib.stride_tricks.as_strided` (used by pooling/conv). "
+            "Please upgrade: pip install 'cupy-cuda12x>=10.0'",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     is_cuda_available = True
 except ImportError:

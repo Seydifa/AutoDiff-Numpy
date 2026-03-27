@@ -12,7 +12,11 @@ Tests for dnp/core/session.py:
 
 # Third-party
 import pytest
-import networkx as nx
+
+# Optional — skip entire test module when networkx is not installed
+nx = pytest.importorskip(
+    "networkx", reason="networkx is required for session graph tests"
+)
 
 # Local imports
 from dnp.core.session import SessionGraph, session
@@ -61,7 +65,7 @@ class TestAddNode:
         class BadNode:
             pass
 
-        with pytest.raises(AttributeError, match="doit posséder un attribut 'name'"):
+        with pytest.raises(AttributeError, match="must have a 'name' attribute"):
             sg.add_node(BadNode())
 
 
@@ -81,13 +85,13 @@ class TestAddEdge:
     def test_missing_parent_raises(self):
         sg = SessionGraph()
         id1 = sg.add_node(MockNode("a"))
-        with pytest.raises(KeyError, match="Le nœud parent 'ghost' n'existe pas"):
+        with pytest.raises(KeyError, match="Parent node 'ghost' does not exist"):
             sg.add_edge("ghost", id1)
 
     def test_missing_child_raises(self):
         sg = SessionGraph()
         id1 = sg.add_node(MockNode("a"))
-        with pytest.raises(KeyError, match="Le nœud enfant 'ghost' n'existe pas"):
+        with pytest.raises(KeyError, match="Child node 'ghost' does not exist"):
             sg.add_edge(id1, "ghost")
 
     def test_none_parent_is_noop(self):
@@ -194,7 +198,7 @@ class TestReset:
         sg = SessionGraph()
         sg.add_node(MockNode("a"))
         sg.reset()
-        assert sg.compteur == 0
+        assert sg.counter == 0
 
     def test_clears_edges(self):
         sg = SessionGraph()

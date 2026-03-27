@@ -1,6 +1,7 @@
 """
 Activation layers.
 """
+
 from .base import Module
 from dnp.core.ops import (
     relu,
@@ -21,7 +22,6 @@ class _ActivationModule(Module):
     def __init__(self, activation_func, name):
         super().__init__()
         self.activation_func = activation_func
-        self.__dict__["name"] = name
 
     def forward(self, x):
         return self.activation_func(x)
@@ -43,13 +43,16 @@ class Tanh(_ActivationModule):
 
 
 class Softmax(_ActivationModule):
-    def __init__(self):
-        super().__init__(softmax, "Softmax")
+    def __init__(self, dim: int = -1):
+        super().__init__(lambda x: softmax(x, axis=dim), f"Softmax(dim={dim})")
+        self.dim = dim
 
 
 class LeakyReLU(_ActivationModule):
     def __init__(self, alpha: float = 0.01):
-        super().__init__(lambda x: leaky_relu(x, alpha=alpha), f"LeakyReLU(alpha={alpha})")
+        super().__init__(
+            lambda x: leaky_relu(x, alpha=alpha), f"LeakyReLU(alpha={alpha})"
+        )
         self.alpha = alpha
 
 

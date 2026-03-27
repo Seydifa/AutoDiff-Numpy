@@ -67,6 +67,12 @@ def graph_fn(func):
     def wrapper(*args, **kwargs):
         from .tensor import Tensor  # deferred — avoids circular import
 
+        # Fast-path: if every positional arg is already a Tensor, skip conversion.
+        if all(isinstance(a, Tensor) for a in args) and all(
+            isinstance(v, Tensor) for v in kwargs.values()
+        ):
+            return func(*args, **kwargs)
+
         def _to_tensor(v):
             if isinstance(v, Tensor):
                 return v
@@ -93,7 +99,7 @@ class SessionGraph:
         # Lightweight hot-path storage (no nx in the loop)
         self._nodes: dict = {}  # node_id  -> display name
         self._edges: list = []  # [(parent_id, child_id), ...]
-        self.compteur = 0
+        self.counter = 0
         self._grad_enabled = True
 
     # ------------------------------------------------------------------
@@ -118,32 +124,32 @@ class SessionGraph:
     # Graph construction  (hot path — plain dict/list, no nx)
     # ------------------------------------------------------------------
 
-    def add_node(self, noeud):
+    def add_node(self, node):
         """Register a node in the graph (no-op when tracking is disabled)."""
         if not self._grad_enabled:
             return None
 
-        if not hasattr(noeud, "name"):
+        if not hasattr(node, "name"):
             raise AttributeError(
-                f"L'objet {type(noeud)} passé au graphe doit posséder un attribut 'name'."
+                f"Object of type {type(node)} passed to the graph must have a 'name' attribute."
             )
 
-        node_id = f"{noeud.name}_{self.compteur}"
-        self.compteur += 1
-        self._nodes[node_id] = noeud.name
+        node_id = f"{node.name}_{self.counter}"
+        self.counter += 1
+        self._nodes[node_id] = node.name
         return node_id
 
-    def add_edge(self, parent_id, enfant_id):
+    def add_edge(self, parent_id, child_id):
         """Record a dependency (parent → child) between two nodes."""
-        if not self._grad_enabled or parent_id is None or enfant_id is None:
+        if not self._grad_enabled or parent_id is None or child_id is None:
             return
 
         if parent_id not in self._nodes:
-            raise KeyError(f"Le nœud parent '{parent_id}' n'existe pas dans le graphe.")
-        if enfant_id not in self._nodes:
-            raise KeyError(f"Le nœud enfant '{enfant_id}' n'existe pas dans le graphe.")
+            raise KeyError(f"Parent node '{parent_id}' does not exist in the graph.")
+        if child_id not in self._nodes:
+            raise KeyError(f"Child node '{child_id}' does not exist in the graph.")
 
-        self._edges.append((parent_id, enfant_id))
+        self._edges.append((parent_id, child_id))
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -156,7 +162,7 @@ class SessionGraph:
         """
         self._nodes.clear()
         self._edges.clear()
-        self.compteur = 0
+        self.counter = 0
 
     @contextmanager
     def graph(self):
@@ -185,6 +191,43 @@ class SessionGraph:
             yield self
         finally:
             pass  # graph stays alive so backward() can traverse it after the block
+
+    @contextmanager
+    def graph_and_backward(self, loss_fn, optimizer=None):
+        """Convenience context manager that runs the forward pass then calls
+        ``loss.backward()`` and (optionally) ``optimizer.step()`` automatically.
+
+        Usage
+        -----
+        >>> with session.graph_and_backward(lambda: model(x_batch)) as loss:
+        ...     pass
+        ... optimizer.step()
+        ... optimizer.zero_grad()
+
+        Or with optimizer:
+
+        >>> with session.graph_and_backward(lambda: model(x_batch), optimizer):
+        ...     pass
+
+        Parameters
+        ----------
+        loss_fn : callable
+            Zero-argument callable that builds the graph and returns the scalar
+            loss Tensor.
+        optimizer : Optimizer or None
+            If provided, ``optimizer.step()`` and ``optimizer.zero_grad()`` are
+            called automatically after ``backward()``.
+        """
+        self.reset()
+        loss = loss_fn()
+        try:
+            yield loss
+        finally:
+            loss.backward()
+            if optimizer is not None:
+                optimizer.step()
+                optimizer.zero_grad()
+            self.reset()
 
     # ------------------------------------------------------------------
     # Backward-compatible nx.DiGraph property (built on-demand)
@@ -217,7 +260,7 @@ class SessionGraph:
 
     def show_graph(
         self,
-        title="Graphe de Calcul (Passe Avant)",
+        title="Computation Graph (Forward Pass)",
         save=False,
         filename="computation_graph.png",
         figsize=None,
@@ -247,19 +290,21 @@ class SessionGraph:
             Override the automatic figure size (width, height) in inches.
         """
         if plt is None:
-            print("⚠️ Matplotlib n'est pas installé. Visualisation impossible.")
+            print(
+                "Warning: matplotlib is not installed. Graph visualization is unavailable."
+            )
             return
 
         if not self._nodes:
-            print("⚠️ Le graphe est actuellement vide. Rien à afficher.")
+            print("The graph is currently empty. Nothing to display.")
             return
 
         try:
             import networkx as nx
         except ImportError:
             print(
-                "⚠️ NetworkX n'est pas installé. Impossible de générer la visualisation.\n"
-                "   Installez-le avec: pip install networkx"
+                "Warning: NetworkX is not installed. Graph visualization is unavailable.\n"
+                "   Install it with: pip install networkx"
             )
             return
 
@@ -393,7 +438,7 @@ class SessionGraph:
             plt.show()
         plt.close()
 
-    # Alias for french/typo
+    # Deprecated alias kept for backward compatibility
     show_graphe = show_graph
 
 

@@ -33,6 +33,7 @@ class Tensor:
         op_kwargs=None,
         name="Var",
         device=None,
+        requires_grad=True,
     ):
         """
         Initialize a new Tensor.
@@ -72,22 +73,36 @@ class Tensor:
             if self.data.dtype != dtype:
                 self.data = self.data.astype(dtype)
 
-        self.grad = backend.zeros_like(self.data)
+        # P1: lazy grad allocation — only created when accumulated during backward()
+        self._grad = None
 
+        self.requires_grad = requires_grad
         self.parents = parents if parents else []
         self.op_func = op_func
         self.op_kwargs = op_kwargs if op_kwargs is not None else {}
         self.name = name
 
-        # Register this node in the session graph
-        self.id = session.add_node(self)
+        # Register this node in the session graph only when gradient tracking is on
+        if self.requires_grad:
+            self.id = session.add_node(self)
 
-        # Re-register any parent that was cleared by session.reset()
-        for p in self.parents:
-            if isinstance(p, Tensor):
-                if getattr(p, "id", None) is None or p.id not in session._nodes:
-                    p.id = session.add_node(p)
-                session.add_edge(p.id, self.id)
+            # Re-register any parent that was cleared by session.reset()
+            for p in self.parents:
+                if isinstance(p, Tensor):
+                    if getattr(p, "id", None) is None or p.id not in session._nodes:
+                        p.id = session.add_node(p)
+                    session.add_edge(p.id, self.id)
+        else:
+            self.id = None
+
+    @property
+    def grad(self):
+        """Gradient buffer (None until backward() accumulates into this tensor)."""
+        return self._grad
+
+    @grad.setter
+    def grad(self, value):
+        self._grad = value
 
     @property
     def shape(self):
@@ -123,7 +138,8 @@ class Tensor:
         """Move tensor data and gradients to CPU."""
         if self.device == "cuda":
             self.data = as_numpy(self.data)
-            self.grad = as_numpy(self.grad)
+            if self._grad is not None:
+                self._grad = as_numpy(self._grad)
         return self
 
     def cuda(self):
@@ -135,7 +151,8 @@ class Tensor:
             )
         if self.device == "cpu":
             self.data = as_cupy(self.data)
-            self.grad = as_cupy(self.grad)
+            if self._grad is not None:
+                self._grad = as_cupy(self._grad)
         return self
 
     def to(self, device: str):
@@ -143,8 +160,10 @@ class Tensor:
         return self.cuda() if device == "cuda" else self.cpu()
 
     def zero_grad(self):
-        """Reset the gradient buffer to zeros (in-place)."""
-        self.grad = backend.zeros_like(self.data, dtype=get_dtype())
+        """Reset the gradient buffer to zeros (allocates if not yet created)."""
+        if self._grad is not None:
+            self._grad.fill(0.0)
+        # If grad was never allocated, leave it as None — backward will create it
 
     def backward(self, grad_entrant=None):
         """Propagate gradients back through the computation graph."""
@@ -170,31 +189,46 @@ class Tensor:
                         stack.append((p, False))
 
         topo.reverse()
-        self.grad += grad_entrant
+        # Accumulate root gradient (lazy allocation)
+        if self._grad is None:
+            self._grad = (
+                grad_entrant.copy() if hasattr(grad_entrant, "copy") else grad_entrant
+            )
+        else:
+            self._grad = self._grad + grad_entrant
 
         # Propagate cleanly using the unified `.vjp` method on `op_func`
         for node in topo:
             op = node.op_func
             if op is None or not hasattr(op, "vjp") or not node.parents:
                 continue
+            g_node = node._grad
+            if g_node is None:
+                continue
 
             if "_vjp_args" in node.op_kwargs:
                 # Dispatches via VJP reconstruction pattern
                 parent_indices = node.op_kwargs["_vjp_parent_indices"]
-                all_grads = op.vjp(node.grad, **node.op_kwargs)
+                all_grads = op.vjp(g_node, **node.op_kwargs)
                 for parent, orig_idx in zip(node.parents, parent_indices):
                     g = all_grads[orig_idx]
                     if isinstance(parent, Tensor) and g is not None:
-                        parent.grad += g
+                        if parent._grad is None:
+                            parent._grad = g.copy() if hasattr(g, "copy") else g
+                        else:
+                            parent._grad = parent._grad + g
             else:
                 # Dispatches raw VJP args normally
                 args_data = [
                     p.data if isinstance(p, Tensor) else p for p in node.parents
                 ]
-                gradients = op.vjp(node.grad, *args_data, **node.op_kwargs)
+                gradients = op.vjp(g_node, *args_data, **node.op_kwargs)
                 for parent, g in zip(node.parents, gradients):
                     if isinstance(parent, Tensor) and g is not None:
-                        parent.grad += g
+                        if parent._grad is None:
+                            parent._grad = g.copy() if hasattr(g, "copy") else g
+                        else:
+                            parent._grad = parent._grad + g
 
     def __repr__(self):
         return f"Tensor({repr(self.data)}, name='{self.name}', device='{self.device}')"
@@ -238,11 +272,20 @@ class Tensor:
         return len(self.data)
 
     def __getitem__(self, idx):
-        """Return a view or scalar segment of the internal data directly."""
-        return self.data[idx]
+        """Return a differentiable slice of this Tensor, tracked in the graph."""
+        import dnp.core.ops as ops
+
+        return ops.getitem(self, idx)
 
     def __setitem__(self, idx, value):
-        """In-place update of underlying data — primarily used by optimizers."""
+        """In-place update of underlying data — primarily used by optimizers.
+
+        .. warning::
+            This is a **non-differentiable** in-place mutation.  Gradient flow
+            through ``x[idx] = value`` is *not* tracked.  For a differentiable
+            alternative use ``ops.setitem(x, idx, value)`` which returns a new
+            Tensor with the gradient intact for both ``x`` and ``value``.
+        """
         self.data[idx] = value.data if isinstance(value, Tensor) else value
 
     # --- Differentiable Operations via internal `_op` logic ---
@@ -329,7 +372,5 @@ class Tensor:
         return self.data >= self._unwrap(other)
 
     def detach(self):
-        """Return a new leaf Tensor that shares no gradient history with self."""
-        return Tensor(
-            self.data.copy(), name=self.name + "_detached", device=self.device
-        )
+        """Return a new leaf Tensor sharing the underlying data buffer with no gradient history."""
+        return Tensor(self.data, name=self.name + "_detached", device=self.device)

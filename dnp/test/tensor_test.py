@@ -86,9 +86,10 @@ class TestTensorCreation:
         t = _Tensor([1.0], name="W")
         assert t.name == "W"
 
-    def test_grad_initialized_to_zero(self):
+    def test_grad_initialized_to_none(self):
+        # P1: grad is lazily allocated — None until backward() accumulates into it.
         t = _Tensor([1.0, 2.0, 3.0])
-        assert close(t.grad, np.zeros(3))
+        assert t.grad is None
 
     def test_parents_default_empty(self):
         t = _Tensor([1.0])
@@ -184,6 +185,7 @@ class TestBackward:
 
     def test_add_backward(self, isolated_session):
         from dnp.core.ops import add
+
         x = _Tensor([2.0, 3.0], name="x")
         y = _Tensor([4.0, 5.0], name="y")
         result = add(x, y)
@@ -193,6 +195,7 @@ class TestBackward:
 
     def test_multiply_backward(self, isolated_session):
         from dnp.core.ops import multiply
+
         x = _Tensor([2.0, 3.0], name="x")
         y = _Tensor([4.0, 5.0], name="y")
         result = multiply(x, y)
@@ -209,6 +212,7 @@ class TestBackward:
 
     def test_chain_rule_exp_then_sum(self, isolated_session):
         from dnp.core.ops import sum, exp
+
         """d/dx sum(exp(x)) = exp(x)."""
         x = _Tensor([0.0, 1.0], name="x")
         exp_x = exp(x)
@@ -218,6 +222,7 @@ class TestBackward:
 
     def test_neg_backward(self, isolated_session):
         from dnp.core.ops import negative
+
         x = _Tensor([3.0, -1.0], name="x")
         result = negative(x)
         result.backward()
@@ -225,6 +230,7 @@ class TestBackward:
 
     def test_no_grad_skips_registration(self, isolated_session):
         from dnp.core.ops import negative
+
         """When a Tensor is created inside no_grad, no edge is registered,
         so backward() on it does NOT propagate gradients to its parents."""
         x = _Tensor([1.0], name="x")
@@ -254,4 +260,5 @@ class TestBackwardMissingRule:
         x = _Tensor([1.0], name="x")
         result = _Tensor([2.0], parents=[x], op_func="unknown_op", name="r")
         result.backward()  # must not raise
-        assert close(x.grad, np.zeros(1))
+        # P1: no gradient propagated to x — grad stays None
+        assert x.grad is None

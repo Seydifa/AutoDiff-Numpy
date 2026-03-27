@@ -17,6 +17,8 @@ from .activations import (
 from .conv import Conv1d, Conv2d
 from .linear import Linear
 from .pooling import (
+    MaxPool1d,
+    AvgPool1d,
     MaxPool2d,
     AvgPool2d,
     GlobalAvgPool1d,
@@ -51,6 +53,7 @@ from .attention import (
     PositionalEncoding,
     FeedForward,
     TransformerEncoderLayer,
+    TransformerDecoderLayer,
     FlashAttention,
     RotaryPositionalEncoding,
 )
@@ -67,6 +70,8 @@ __all__ = [
     "Conv1d",
     "Conv2d",
     # Pool
+    "MaxPool1d",
+    "AvgPool1d",
     "MaxPool2d",
     "AvgPool2d",
     "GlobalAvgPool1d",
@@ -121,6 +126,7 @@ __all__ = [
     "PositionalEncoding",
     "FeedForward",
     "TransformerEncoderLayer",
+    "TransformerDecoderLayer",
     "FlashAttention",
     "RotaryPositionalEncoding",
     # Advanced

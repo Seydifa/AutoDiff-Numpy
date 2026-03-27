@@ -19,12 +19,15 @@ operation, define a forward function and decorate its backward with::
 # Third-party libraries
 from .backend import backend, safe_eps, get_dtype
 from .tensor import Tensor
+from .session import session
 
 
-EPSILON = 1e-8
+# Precomputed constants — avoids backend calls on every forward pass.
+_GELU_COEFF: float = 0.7978845608028654  # sqrt(2/pi)
+_LOG2: float = 0.6931471805599453  # log(2.0)
 
-# Precomputed constant for GELU — avoids recomputing sqrt on every call.
-_GELU_COEFF = float(backend.sqrt(2.0 / backend.pi))  # ≈ 0.7978845608028654
+# Deprecated — kept for backward compatibility; use safe_eps() instead.
+EPSILON: float = 1e-8
 
 # ---------------------------------------------------------------------------
 # VJP_RULES registry
@@ -90,15 +93,14 @@ def _restore_reduced_dims(g, x_shape, axis, keepdims):
     axis in expand_dims).
     """
     if keepdims or axis is None:
-        # g is already shaped for broadcasting; broadcast_to makes it explicit.
-        return backend.broadcast_to(g, x_shape).copy()
+        return backend.broadcast_to(g, x_shape)
     if isinstance(axis, (list, tuple)):
         result = g
         for ax in sorted(int(a) % len(x_shape) for a in axis):
             result = backend.expand_dims(result, ax)
     else:
         result = backend.expand_dims(g, int(axis) % len(x_shape))
-    return backend.broadcast_to(result, x_shape).copy()
+    return backend.broadcast_to(result, x_shape)
 
 
 # ---------------------------------------------------------------------------
@@ -418,10 +420,9 @@ def _avg_pool2d_backward(g, x, kernel_size, stride=1, padding=0):
 
     Strategy
     --------
-    Each output cell (b,c,i,j) contributes g[b,c,i,j]/(kH*kW) to a rectangular
-    patch of grad_x.  We scatter-add all contributions in one call by building
-    absolute (h, w) index tensors for every (output_pos, kernel_offset) pair and
-    using advanced indexing — no Python loop over kH, kW, or spatial dims.
+    Build (kH, kW) offset grids once with meshgrid, then scatter-add the
+    scaled upstream gradient for *all* kernel offsets simultaneously using
+    advanced indexing — no Python loops at all.
 
     Works identically on NumPy (CPU) and CuPy (GPU); no data transfer.
     """
@@ -439,29 +440,35 @@ def _avg_pool2d_backward(g, x, kernel_size, stride=1, padding=0):
 
     g_scaled = g / (kH * kW)  # (B, C, H_out, W_out)
 
-    # ---- expand for full scatter call (B, C, H_out, W_out, kH, kW) --------
-    # We loop over kH*kW — but that's a Python-level loop over *kernel offsets*
-    # (typically 9 iters for 3×3), and every iter is a fully vectorized
-    # (B, C, H_out, W_out) scatter.  Total Python iters = kH*kW, not B*C*spatial.
-    grad_x = backend.zeros((batch, channels, H_padded, W_padded), dtype=g.dtype)
-    b_idx = backend.arange(batch, dtype=backend.int64).reshape(batch, 1, 1, 1)
-    c_idx = backend.arange(channels, dtype=backend.int64).reshape(1, channels, 1, 1)
+    # Build all kernel-offset positions at once: kh_grid/kw_grid shape (kH, kW)
+    kh_range = backend.arange(kH, dtype=backend.int64)
+    kw_range = backend.arange(kW, dtype=backend.int64)
+    kh_grid, kw_grid = backend.meshgrid(kh_range, kw_range, indexing="ij")
+    # Flatten to (kH*kW,)
+    kh_flat = kh_grid.ravel()  # (K,) where K=kH*kW
+    kw_flat = kw_grid.ravel()
 
-    for kh in range(kH):
-        for kw in range(kW):
-            h_pos = backend.arange(H_out, dtype=backend.int64) * sH + kh  # (H_out,)
-            w_pos = backend.arange(W_out, dtype=backend.int64) * sW + kw  # (W_out,)
-            # Broadcast h_pos→(1,1,H_out,1), w_pos→(1,1,1,W_out)
-            backend.add.at(
-                grad_x,
-                (
-                    b_idx,
-                    c_idx,
-                    h_pos.reshape(1, 1, H_out, 1),
-                    w_pos.reshape(1, 1, 1, W_out),
-                ),
-                g_scaled,
-            )
+    # Output position grids: h_out_grid/w_out_grid shape (H_out,) and (W_out,)
+    h_out_range = backend.arange(H_out, dtype=backend.int64)
+    w_out_range = backend.arange(W_out, dtype=backend.int64)
+
+    # Absolute input positions for every (output pos, kernel offset) pair:
+    # abs_h shape: (K, H_out, 1) after broadcasting
+    # abs_w shape: (K, 1, W_out)
+    abs_h = kh_flat[:, None, None] + h_out_range[None, :, None] * sH  # (K, H_out, 1)
+    abs_w = kw_flat[:, None, None] + w_out_range[None, None, :] * sW  # (K, 1, W_out)
+
+    # Index grids for batch and channel: (batch,1,1,1,1) etc.
+    b_idx = backend.arange(batch, dtype=backend.int64)[:, None, None, None, None]
+    c_idx = backend.arange(channels, dtype=backend.int64)[None, :, None, None, None]
+    # abs_h/w: add K dim → (1,1,K,H_out,1) and (1,1,K,1,W_out)
+    h_idx = abs_h[None, None, :, :, :]  # (1, 1, K, H_out, 1)
+    w_idx = abs_w[None, None, :, :, :]  # (1, 1, K, 1, W_out)
+    # g_scaled needs K dim: (B, C, 1, H_out, W_out)
+    g_exp = g_scaled[:, :, None, :, :]  # broadcast over K
+
+    grad_x = backend.zeros((batch, channels, H_padded, W_padded), dtype=g.dtype)
+    backend.add.at(grad_x, (b_idx, c_idx, h_idx, w_idx), g_exp)
 
     if padding > 0:
         grad_x = grad_x[:, :, padding:-padding, padding:-padding]
@@ -808,13 +815,13 @@ def _vjp_relu(g, x):
 
 
 @vjp_rule(func=leaky_relu)
-def _vjp_leaky_relu(g, x):
-    return (g * backend.where(x > 0, 1.0, 0.01),)
+def _vjp_leaky_relu(g, x, alpha=0.01):
+    return (g * backend.where(x > 0, 1.0, alpha),)
 
 
 @vjp_rule(func=elu)
-def _vjp_elu(g, x):
-    return (g * backend.where(x > 0, 1.0, 1.0 * backend.exp(x)),)
+def _vjp_elu(g, x, alpha=1.0):
+    return (g * backend.where(x > 0, 1.0, alpha * backend.exp(x)),)
 
 
 @vjp_rule(func=softplus)
@@ -1216,11 +1223,7 @@ def log_cosh_loss(y_pred, y_true):
     r = y_pred - y_true
     # Stable: log cosh(r) = |r| + softplus(-2|r|) - log2
     abs_r = backend.abs(r)
-    val = (
-        abs_r
-        + backend.log1p(backend.exp(-2.0 * abs_r))
-        - backend.log(backend.array(2.0, dtype=r.dtype))
-    )
+    val = abs_r + backend.log1p(backend.exp(-2.0 * abs_r)) - _LOG2
     return backend.mean(val)
 
 
@@ -1407,7 +1410,9 @@ def kl_divergence_loss(p, q):
 
 @vjp_rule(func=kl_divergence_loss)
 def _vjp_kl_divergence_loss(g, p, q):
-    N = p.shape[0]
+    # For 2D (B, C): mean is over B, so divide by B.
+    # For 1D (C,): sum(axis=-1) → scalar, mean(scalar) = scalar, no division.
+    N = p.shape[0] if p.ndim > 1 else 1
     eps = safe_eps(p)
     p_safe = backend.clip(p, eps, 1.0)
     q_safe = backend.clip(q, eps, 1.0)
@@ -1830,9 +1835,11 @@ def rnn_cell(x, Wh, Wx, bh, h0=None):
 
 
 @vjp_rule(func=rnn_cell)
-def _vjp_rnn_cell(g, x, Wh, Wx, bh, h0=None):
+def _vjp_rnn_cell(g, x, Wh, Wx, bh, h0=None, h_seq=None, h0_used=None):
     """BPTT VJP for Simple RNN.  g : (B, T, d_h).  Returns (dx, dWh, dWx, dbh, dh0)."""
-    h_seq, h0_used = _rnn_forward_cache(x, Wh, Wx, bh, h0)
+    # P2: reuse cached forward activations if available; otherwise recompute.
+    if h_seq is None:
+        h_seq, h0_used = _rnn_forward_cache(x, Wh, Wx, bh, h0)
     B, T, _ = x.shape
     d_h = Wh.shape[0]
     dx = backend.zeros_like(x)
@@ -1899,11 +1906,28 @@ def lstm_cell(x, W, b, h0=None, c0=None):
 
 
 @vjp_rule(func=lstm_cell)
-def _vjp_lstm_cell(g, x, W, b, h0=None, c0=None):
+def _vjp_lstm_cell(
+    g,
+    x,
+    W,
+    b,
+    h0=None,
+    c0=None,
+    h_seq=None,
+    c_seq=None,
+    f_seq=None,
+    i_seq=None,
+    ct_seq=None,
+    o_seq=None,
+    h0_u=None,
+    c0_u=None,
+):
     """BPTT VJP for LSTM.  g : (B, T, d_h).  Returns (dx, dW, db, dh0, dc0)."""
-    h_seq, c_seq, f_seq, i_seq, ct_seq, o_seq, h0_u, c0_u = _lstm_forward_cache(
-        x, W, b, h0, c0
-    )
+    # P2: reuse cached forward activations if available; otherwise recompute.
+    if h_seq is None:
+        h_seq, c_seq, f_seq, i_seq, ct_seq, o_seq, h0_u, c0_u = _lstm_forward_cache(
+            x, W, b, h0, c0
+        )
     B, T, _ = x.shape
     d_h = W.shape[1] // 4
     dx = backend.zeros_like(x)
@@ -1979,11 +2003,28 @@ def gru_cell(x, Wr, Wz, Wh, br, bz, bh, h0=None):
 
 
 @vjp_rule(func=gru_cell)
-def _vjp_gru_cell(g, x, Wr, Wz, Wh, br, bz, bh, h0=None):
+def _vjp_gru_cell(
+    g,
+    x,
+    Wr,
+    Wz,
+    Wh,
+    br,
+    bz,
+    bh,
+    h0=None,
+    h_seq=None,
+    r_seq=None,
+    z_seq=None,
+    ht_seq=None,
+    h0_u=None,
+):
     """BPTT VJP for GRU.  Returns (dx, dWr, dWz, dWh, dbr, dbz, dbh, dh0)."""
-    h_seq, r_seq, z_seq, ht_seq, h0_u = _gru_forward_cache(
-        x, Wr, Wz, Wh, br, bz, bh, h0
-    )
+    # P2: reuse cached forward activations if available; otherwise recompute.
+    if h_seq is None:
+        h_seq, r_seq, z_seq, ht_seq, h0_u = _gru_forward_cache(
+            x, Wr, Wz, Wh, br, bz, bh, h0
+        )
     B, T, _ = x.shape
     d_h = Wr.shape[1]
     dx = backend.zeros_like(x)
@@ -2123,6 +2164,64 @@ VJP_RULES[embedding_lookup] = _vjp_gather
 
 
 # ---------------------------------------------------------------------------
+# 5b. General Indexing (getitem) — differentiable slice / fancy-index
+# ---------------------------------------------------------------------------
+
+
+def getitem(x, idx):
+    """Return ``x[idx]`` for any valid NumPy index (slice, int, array).\n\n    The index *idx* is treated as non-differentiable; only *x* has a VJP."""
+    return x[idx]
+
+
+@vjp_rule(func=getitem)
+def _vjp_getitem(g, x, idx):
+    """Scatter gradient back into *x* shape via ``add.at``."""
+    x_grad = backend.zeros_like(x)
+    backend.add.at(x_grad, idx, g)
+    return (x_grad, None)  # None for non-differentiable idx
+
+
+def setitem(x, idx, value):
+    """Differentiable copy-and-set: returns a copy of *x* with ``x[idx] = value``.
+
+    Unlike Tensor.__setitem__ (which mutates *x* in-place and breaks the graph),
+    this function creates a new Tensor in the computation graph so gradients
+    flow correctly through both *x* and *value*.
+
+    Parameters
+    ----------
+    x : array-like
+        Source tensor.
+    idx : slice / int / array
+        Index expression — not differentiable.
+    value : array-like
+        Values to insert at *idx* — differentiable.
+
+    Returns
+    -------
+    array  shape identical to *x*
+    """
+    out = x.copy()
+    out[idx] = value
+    return out
+
+
+@vjp_rule(func=setitem)
+def _vjp_setitem(g, x, idx, value):
+    """VJP for the copy-and-set op.
+
+    *  grad_x   = g, but zeroed at the positions written by idx
+       (those positions came purely from *value*, not from *x*).
+    *  grad_idx = None  (non-differentiable index)
+    *  grad_val = g[idx]  (gradient flowing back to the inserted values)
+    """
+    grad_x = g.copy()
+    grad_x[idx] = 0
+    grad_val = g[idx]
+    return (grad_x, None, grad_val)
+
+
+# ---------------------------------------------------------------------------
 # 6. Scaled Dot-Product Attention
 # ---------------------------------------------------------------------------
 
@@ -2242,30 +2341,97 @@ def _vjp_sinkhorn(g, a, b, M, reg, num_iters=20):
     return (None, None, dM, None, None)
 
 
-def neural_ode_solve(z0, t_span, steps=10):
+def _apply_odefunc_data(odefunc, z):
+    """Run a Module odefunc on raw array ``z``, returning the output as a raw array.
+
+    Temporarily disables the computation graph so that internal Tensor creation
+    inside ``odefunc`` does not pollute the outer session graph.
     """
-    Simulated Neural ODE forward solver (Euler method).
+    prev = session._grad_enabled
+    session._grad_enabled = False
+    try:
+        z_t = Tensor(z, name="ode_z")
+        out = odefunc(z_t)
+    finally:
+        session._grad_enabled = prev
+    return out.data if hasattr(out, "data") else out
+
+
+def neural_ode_solve(z0, t_span, steps=10, odefunc=None):
+    """
+    Neural ODE forward solver using the Euler method.
     z(t+dt) = z(t) + f(z) * dt
+
+    Parameters
+    ----------
+    z0 : array
+        Initial state.
+    t_span : array of shape (2,)
+        ``[t0, t1]`` — start and end times.
+    steps : int
+        Number of Euler integration steps.
+    odefunc : callable (Module), optional
+        The ODE function ``f(z) -> dz/dt``.  When *None* a mock
+        ``f(z) = -0.5 * z`` is used for backward-compatibility testing.
     """
     dt = (t_span[1] - t_span[0]) / steps
     z = z0
     for _ in range(steps):
-        # A mock f(z) = -0.5 * z
-        z = z - 0.5 * z * dt
+        dz = _apply_odefunc_data(odefunc, z) if odefunc is not None else -0.5 * z
+        z = z + dz * dt
     return z
 
 
 @vjp_rule(func=neural_ode_solve)
-def _vjp_neural_ode_solve(g, z0, t_span, steps=10):
-    """
-    Simulated Continuous Adjoint Method.
-    Solves the ODE backwards in time to compute gradients in O(1) memory.
+def _vjp_neural_ode_solve(g, z0, t_span, steps=10, odefunc=None):
+    """Continuous adjoint method for Neural ODE.
+
+    Rebuilds the forward trajectory then integrates the adjoint ODE backward.
+    When ``odefunc`` is provided the Jacobian-vector product ``J_f^T @ a`` is
+    approximated via element-wise finite differences (exact up to O(eps^2)).
+
+    Note: gradients are computed only w.r.t. ``z0``.  Gradients w.r.t.
+    odefunc parameters require a separate differentiation pass through the
+    module.
     """
     dt = (t_span[1] - t_span[0]) / steps
-    a = g
+    EPS_FD = 1e-5
+
+    # --- rebuild forward trajectory ---
+    z = z0
+    trajectory = [z.copy()]
     for _ in range(steps):
-        # da/dt = -a * df/dz = -a * (-0.5) = 0.5 * a, solve backward
-        a = a - 0.5 * a * dt
+        dz = _apply_odefunc_data(odefunc, z) if odefunc is not None else -0.5 * z
+        z = z + dz * dt
+        trajectory.append(z.copy())
+
+    # --- adjoint backward pass ---
+    a = g.copy()
+    for i in range(steps - 1, -1, -1):
+        z_i = trajectory[i]
+        if odefunc is not None:
+            f_z = _apply_odefunc_data(odefunc, z_i)
+            # Compute J_f^T @ a via element-wise finite differences.
+            # (J_f^T @ a)_i = sum_j (df_j/dz_i) * a_j
+            Jt_a = backend.zeros_like(a)
+            z_flat = z_i.ravel()
+            a_flat = a.ravel()
+            for j in range(z_i.size):
+                z_pert = z_flat.copy()
+                z_pert[j] += EPS_FD
+                col_j = (
+                    _apply_odefunc_data(odefunc, z_pert.reshape(z_i.shape)).ravel()
+                    - f_z.ravel()
+                ) / EPS_FD
+                Jt_a.ravel()[j] = float(
+                    backend.dot(
+                        a_flat.astype(backend.float64), col_j.astype(backend.float64)
+                    )
+                )
+            a = a + Jt_a * dt
+        else:
+            # f(z) = -0.5*z  →  J_f = -0.5*I  →  J_f^T @ a = -0.5*a
+            a = a + (-0.5 * a) * dt
     return (a, None, None)
 
 

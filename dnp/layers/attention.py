@@ -10,6 +10,7 @@ from dnp.layers.regularization import Dropout
 from dnp.core.tensor import Tensor
 from dnp.core.backend import backend, get_dtype, is_cupy_array, to_device
 from dnp.core import ops
+import numpy as _np
 
 
 class ScaledDotProductAttention(Module):
@@ -167,6 +168,96 @@ class TransformerEncoderLayer(Module):
         return x
 
 
+class TransformerDecoderLayer(Module):
+    """Single transformer decoder layer.
+
+    Implements the standard three-sublayer decoder block:
+    1. Masked self-attention  (query = key = value = target sequence)
+    2. Cross-attention        (query = target, key/value = encoder output)
+    3. Position-wise FFN
+
+    Each sublayer is wrapped with Add & Norm (pre-norm style is not used;
+    the residual is added *before* the layer norm for compatibility with the
+    original "Attention is All You Need" paper).
+
+    Parameters
+    ----------
+    d_model : int
+        Model / embedding dimensionality.
+    num_heads : int
+        Number of parallel attention heads.  Must divide ``d_model``.
+    d_ff : int
+        Inner dimensionality of the position-wise feed-forward network.
+    dropout_p : float, default 0.1
+        Dropout probability applied after each sub-layer (only during training).
+    activation : str, default 'relu'
+        Activation inside the feed-forward network ('relu' or 'gelu').
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        dropout_p: float = 0.1,
+        activation: str = "relu",
+    ):
+        super().__init__()
+        # 1. Masked self-attention
+        self.self_attn = MultiHeadAttention(d_model, num_heads)
+        self.norm1 = LayerNorm(d_model)
+        # 2. Cross-attention
+        self.cross_attn = MultiHeadAttention(d_model, num_heads)
+        self.norm2 = LayerNorm(d_model)
+        # 3. FFN
+        self.ffn = FeedForward(
+            d_model, d_ff, activation=activation, dropout_p=dropout_p
+        )
+        self.norm3 = LayerNorm(d_model)
+        self.dropout_p = dropout_p
+
+    def forward(
+        self,
+        tgt: Tensor,
+        memory: Tensor,
+        tgt_mask=None,
+        memory_mask=None,
+    ) -> Tensor:
+        """Forward pass.
+
+        Parameters
+        ----------
+        tgt : Tensor, shape (batch, tgt_len, d_model)
+            Target sequence (decoder input).
+        memory : Tensor, shape (batch, src_len, d_model)
+            Encoder output.
+        tgt_mask : array-like or None
+            Optional mask for the self-attention sublayer.
+        memory_mask : array-like or None
+            Optional mask for the cross-attention sublayer.
+
+        Returns
+        -------
+        Tensor, shape (batch, tgt_len, d_model)
+        """
+        # --- sublayer 1: masked self-attention ---
+        sa_out = self.self_attn(tgt, tgt, tgt, tgt_mask)
+        if self.training and self.dropout_p > 0.0:
+            sa_out = ops.dropout(sa_out, p=self.dropout_p, training=True)
+        tgt = self.norm1(tgt + sa_out)
+
+        # --- sublayer 2: cross-attention ---
+        ca_out = self.cross_attn(tgt, memory, memory, memory_mask)
+        if self.training and self.dropout_p > 0.0:
+            ca_out = ops.dropout(ca_out, p=self.dropout_p, training=True)
+        tgt = self.norm2(tgt + ca_out)
+
+        # --- sublayer 3: feed-forward ---
+        ffn_out = self.ffn(tgt)
+        tgt = self.norm3(tgt + ffn_out)
+        return tgt
+
+
 # -----------------------------------------------------------------
 # COMPLEX / ADVANCED ATTENTION
 # -----------------------------------------------------------------
@@ -194,4 +285,16 @@ class RotaryPositionalEncoding(Module):
         self.base = base
 
     def forward(self, x: Tensor, seq_dim: int = 1) -> Tensor:
-        return ops.rope(x, dim=self.dim, seq_dim=seq_dim, base=self.base)
+        seq_len = x.shape[seq_dim]
+        half_d = self.dim // 2
+        dtype = get_dtype()
+        # theta_i = base^(-2i/dim) for i = 0, ..., half_d - 1
+        theta = _np.power(
+            float(self.base),
+            -_np.arange(0, half_d, dtype=_np.float32) * (2.0 / self.dim),
+        ).astype(dtype)
+        positions = _np.arange(seq_len, dtype=dtype)
+        freqs = _np.outer(positions, theta)  # (seq_len, half_d)
+        cos_freqs = Tensor(backend.asarray(_np.cos(freqs)), name="rope_cos")
+        sin_freqs = Tensor(backend.asarray(_np.sin(freqs)), name="rope_sin")
+        return ops.rope(x, cos_freqs, sin_freqs)

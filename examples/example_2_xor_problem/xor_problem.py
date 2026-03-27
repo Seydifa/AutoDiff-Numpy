@@ -17,8 +17,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-# Add project root to path
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+# Run `pip install -e .` from the project root once, then remove sys.path manipulation.
+try:
+    import dnp  # noqa: F401 — check availability
+except ImportError:
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import dnp
 from dnp.core.session import session

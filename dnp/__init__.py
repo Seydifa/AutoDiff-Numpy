@@ -1,5 +1,17 @@
 # Local imports: Core modules
-from . import ops, core
+import warnings as _warnings
+from . import core
+
+
+# Lazy import of the deprecated shim subpackage.
+# Using __getattr__ means it only loads (and warns) when accessed directly.
+def __getattr__(name):
+    if name == "ops":
+        import importlib as _il
+
+        return _il.import_module("dnp.ops")
+    raise AttributeError(f"module 'dnp' has no attribute {name!r}")
+
 
 # Dtype and device control — primary public API
 from .core.backend import set_dtype, get_dtype, set_device
@@ -8,60 +20,9 @@ from .core.backend import set_dtype, get_dtype, set_device
 from .core.tensor import Tensor
 from .core.session import session, graph_fn
 
-# Local imports: Layer classes available at top level
-from .layers import (
-    Module,
-    Sequential,
-    Linear,
-    Conv2d,
-    MaxPool2d,
-    AvgPool2d,
-    GlobalAvgPool1d,
-    GlobalMaxPool1d,
-    GlobalAvgPool2d,
-    GlobalMaxPool2d,
-    ReLU,
-    Sigmoid,
-    Tanh,
-    Softmax,
-    LeakyReLU,
-    ELU,
-    Softplus,
-    Swish,
-    GELU,
-    BatchNorm1d,
-    BatchNorm2d,
-    LayerNorm,
-    Dropout,
-    Embedding,
-    ScaledDotProductAttention,
-    MultiHeadAttention,
-    SelfAttention,
-    PositionalEncoding,
-    FeedForward,
-    TransformerEncoderLayer,
-    Flatten,
-    Reshape,
-    ExpandDims,
-    Squeeze,
-    Repeat,
-    Concatenate,
-    Stack,
-    CrossEntropyLoss,
-    MSELoss,
-    MAELoss,
-    L1Loss,
-    HuberLoss,
-    SmoothL1Loss,
-    LogCoshLoss,
-    BCELoss,
-    BCEWithLogitsLoss,
-    NLLLoss,
-    KLDivLoss,
-    FocalLoss,
-    HingeLoss,
-    SquaredHingeLoss,
-)
+# Layer classes — wildcard so new layers only need dnp/layers/__init__.py updates.
+from .layers import *  # noqa: F401, F403
+from .layers import __all__ as _layers_all
 
 # Local imports: Optimizer classes available at top level
 from .core.optimizers import (
@@ -89,6 +50,9 @@ from .utils import (
     ModelCheckpoint,
     ProgressLogger,
     Trainer,
+    DataLoader,
+    clip_grad_norm_,
+    clip_grad_value_,
 )
 
 __all__ = [
@@ -101,69 +65,8 @@ __all__ = [
     "Tensor",
     "session",
     "graph_fn",
-    # Base classes
-    "Module",
-    "Sequential",
-    # Linear layers
-    "Linear",
-    # Convolutional layers
-    "Conv2d",
-    # Pooling layers
-    "MaxPool2d",
-    "AvgPool2d",
-    "GlobalAvgPool1d",
-    "GlobalMaxPool1d",
-    "GlobalAvgPool2d",
-    "GlobalMaxPool2d",
-    # Activation layers
-    "ReLU",
-    "Sigmoid",
-    "Tanh",
-    "Softmax",
-    "LeakyReLU",
-    "ELU",
-    "Softplus",
-    "Swish",
-    "GELU",
-    # Normalization layers
-    "BatchNorm1d",
-    "BatchNorm2d",
-    "LayerNorm",
-    # Regularization layers
-    "Dropout",
-    # Embedding layers
-    "Embedding",
-    # Attention layers
-    "ScaledDotProductAttention",
-    "MultiHeadAttention",
-    "SelfAttention",
-    # Transformer building blocks
-    "PositionalEncoding",
-    "FeedForward",
-    "TransformerEncoderLayer",
-    # Utility layers
-    "Flatten",
-    "Reshape",
-    "ExpandDims",
-    "Squeeze",
-    "Repeat",
-    "Concatenate",
-    "Stack",
-    # Loss functions
-    "CrossEntropyLoss",
-    "MSELoss",
-    "MAELoss",
-    "L1Loss",
-    "HuberLoss",
-    "SmoothL1Loss",
-    "LogCoshLoss",
-    "BCELoss",
-    "BCEWithLogitsLoss",
-    "NLLLoss",
-    "KLDivLoss",
-    "FocalLoss",
-    "HingeLoss",
-    "SquaredHingeLoss",
+    # All layer classes (auto-synced with dnp/layers/__all__)
+    *_layers_all,
     # Optimization algorithms
     "Optimizer",
     "SGD",
@@ -186,4 +89,7 @@ __all__ = [
     "ModelCheckpoint",
     "ProgressLogger",
     "Trainer",
+    "DataLoader",
+    "clip_grad_norm_",
+    "clip_grad_value_",
 ]

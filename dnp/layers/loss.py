@@ -31,6 +31,9 @@ def _reduce(loss: Tensor, reduction: str) -> Tensor:
 class CrossEntropyLoss(Module):
     """Cross-entropy loss for multi-class classification."""
 
+    def __init__(self):
+        super().__init__()
+
     def forward(self, logits: Tensor, targets) -> Tensor:
         shape = logits.shape
         if len(shape) > 2:
@@ -174,6 +177,9 @@ class LogCoshLoss(Module):
 
 class NLLLoss(Module):
     """Negative log-likelihood loss from log-probabilities and integer targets."""
+
+    def __init__(self):
+        super().__init__()
 
     def forward(self, log_probs: Tensor, targets) -> Tensor:
         if isinstance(targets, Tensor):

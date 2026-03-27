@@ -47,6 +47,15 @@ class Conv2d(Module):
 
     def forward(self, x: Tensor) -> Tensor:
         """Forward pass using vectorized im2col + matmul kernel."""
+        if x.ndim != 4:
+            raise ValueError(
+                f"Conv2d expects a 4-D input (N, C, H, W), got shape {x.shape}"
+            )
+        if x.shape[1] != self.in_channels:
+            raise ValueError(
+                f"Conv2d: expected {self.in_channels} input channels, "
+                f"got {x.shape[1]} (input shape {x.shape})"
+            )
         batch_size, in_channels, H, W = x.shape
         out_channels, _, kH, kW = self.W.shape
         stride_h, stride_w = self.stride
@@ -72,6 +81,13 @@ class Conv2d(Module):
             bias_reshaped = ops.reshape(self.b, newshape=(1, self.out_channels, 1, 1))
             y = y + bias_reshaped
         return y
+
+    def __repr__(self) -> str:
+        return (
+            f"Conv2d({self.in_channels}, {self.out_channels}, "
+            f"kernel_size={self.kernel_size}, stride={self.stride}, "
+            f"padding={self.padding}, bias={self.use_bias})"
+        )
 
 
 class Conv1d(Module):
@@ -108,6 +124,15 @@ class Conv1d(Module):
 
     def forward(self, x: Tensor) -> Tensor:
         """Forward pass using 2D dimensional projection."""
+        if x.ndim != 3:
+            raise ValueError(
+                f"Conv1d expects a 3-D input (N, C, L), got shape {x.shape}"
+            )
+        if x.shape[1] != self.in_channels:
+            raise ValueError(
+                f"Conv1d: expected {self.in_channels} input channels, "
+                f"got {x.shape[1]} (input shape {x.shape})"
+            )
         # x is (batch, in_channels, L) -> expand to (batch, in_channels, 1, L)
         x_2d = ops.expand_dims(x, axis=2)
 
@@ -135,3 +160,10 @@ class Conv1d(Module):
             bias_reshaped = ops.reshape(self.b, newshape=(1, self.out_channels, 1))
             y = y + bias_reshaped
         return y
+
+    def __repr__(self) -> str:
+        return (
+            f"Conv1d({self.in_channels}, {self.out_channels}, "
+            f"kernel_size={self.kernel_size}, stride={self.stride}, "
+            f"padding={self.padding}, bias={self.use_bias})"
+        )

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import pickle
 import time
+import warnings
 from typing import Callable, Iterable, List, Optional, Sequence
 
 import numpy as np
@@ -528,13 +529,27 @@ def _restore_weights(model, weights: list) -> None:
 
 
 def _save_model(model, path: str) -> None:
-    """Save model to *path* as ``.pkl`` or ``.npz``."""
+    """Save model to *path* as ``.npz`` (recommended) or ``.pkl`` (legacy).
+
+    .. warning::
+        The ``.pkl`` format uses Python's ``pickle`` module.  Only load
+        ``.pkl`` checkpoints from **trusted sources** — a malicious file can
+        execute arbitrary code during deserialization (CWE-502).
+        Prefer the ``.npz`` format for all new code.
+    """
     if path.endswith(".npz"):
         arrays = {
             f"param_{i}": as_numpy(p.data) for i, p in enumerate(model.parameters())
         }
         np.savez(path, **arrays)
     else:
+        warnings.warn(
+            f"Saving model as pickle ('{path}'). "
+            "Pickle files can execute arbitrary code when loaded from untrusted sources. "
+            "Use a '.npz' extension for safe weight-only serialization.",
+            UserWarning,
+            stacklevel=2,
+        )
         with open(path, "wb") as fh:
             pickle.dump(
                 {"weights": [as_numpy(p.data) for p in model.parameters()]},
@@ -544,13 +559,26 @@ def _save_model(model, path: str) -> None:
 
 
 def _load_model(model, path: str) -> None:
-    """Load model weights from *path*."""
+    """Load model weights from *path*.
+
+    .. warning::
+        Loading a ``.pkl`` checkpoint executes the pickled bytecode.  Only
+        load files from **trusted sources** (CWE-502).  Prefer ``.npz``.
+    """
     if path.endswith(".npz"):
         data = np.load(path)
         for i, p in enumerate(model.parameters()):
             p[...] = data[f"param_{i}"]
     else:
+        warnings.warn(
+            f"Loading model from pickle ('{path}'). "
+            "Only load pickle files from trusted sources — "
+            "malicious files can execute arbitrary code (CWE-502). "
+            "Prefer saving/loading with '.npz' instead.",
+            UserWarning,
+            stacklevel=2,
+        )
         with open(path, "rb") as fh:
-            checkpoint = pickle.load(fh)
+            checkpoint = pickle.load(fh)  # noqa: S301 — guarded by warning above
         for p, w in zip(model.parameters(), checkpoint["weights"]):
             p[...] = w
