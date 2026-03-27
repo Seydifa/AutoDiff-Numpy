@@ -1,133 +1,139 @@
 """
 dnp/core/ops.py
 ===============
-``Ops`` class and all pre-built operation instances.
+``Ops`` class + differentiable operation instances.
 
-Each ``Ops`` object bundles:
-  - a forward callable (``op.func``) — the NumPy ufunc / function used as the
-    ``VJP_RULES`` registry key, guaranteeing unique identity across backends.
-  - explicit backend dispatch at call time (CuPy when arrays live on GPU)
-  - a ``graph_fn`` wrapper that auto-promotes raw arrays / scalars to ``Tensor``
+Design paradigm
+---------------
+1. VJP rules and forward functions belong in ``vjp_rules.py``.  Define the
+   forward callable and register its backward there with ``@vjp_rule``.
+2. Kernel call functions belong here — named ``<opname>_kernel_call`` — for
+   ops that need custom graph-wiring: caching intermediate values (dropout
+   mask), or keeping non-differentiable arguments out of the graph (where's
+   condition, gather's integer indices).
+3. ``Ops`` instances are built here *after* both VJP rules and kernel calls
+   are defined.  ``Ops(func, vjp_fn, name, kernel_call=None)`` binds the VJP
+   once at construction — no runtime dict lookup — so a custom op registered
+   under the same name always uses its own correct VJP.
+4. ``tensor.py`` calls ``op.vjp(...)``; ``Ops.vjp`` delegates directly to
+   ``self._vjp`` and never routes through ``VJP_RULES``.
 
 Sections
 --------
-1. ``Ops`` base class + specialised subclasses
-   (``_DropoutOps``, ``_GatherOps``, ``_WhereOps``)
-2. Pre-built op instances grouped by category
-   binary · unary · trig · rounding · reductions · shape ·
-   array-manipulation · nn activations · conv · pooling · norm
-3. Array creation helpers (``arange``, ``ones``, ``zeros``, …)
-4. ``_RandomModule``  (``ops.random.randn``, …)
-5. ``__all__``
+1. Imports & Helpers
+2. ``Ops`` base class
+3. Kernel call functions  (where / gather / dropout)
+4. Auto-generation loop  (``VJP_RULES`` → ``Ops`` instances, public names)
+5. Manual wrappers for private-named helpers  (_reshape / _concatenate / _stack)
+6. Special-case ops with kernel calls  (where / gather / embedding / dropout)
+7. Array-creation helpers
+8. ``_RandomModule``
+9. ``__all__``
 """
 
-# Third-party libraries
-import numpy as np
+# ===========================================================================
+# 1. Imports & Helpers
+# ===========================================================================
 
-# Local imports
+from .tensor import Tensor                                   # graph node
+from .backend import backend, safe_eps, get_dtype, get_xp, as_numpy, is_cupy_array
 from .session import graph_fn
-from .vjp_rules import (
-    VJP_RULES,
-    # forward callables used as func= for Ops instances below
-    sigmoid,
-    relu,
-    leaky_relu,
-    elu,
-    softplus,
-    swish,
-    gelu,
-    softmax,
-    conv2d,
-    max_pool2d,
-    avg_pool2d,
-    dropout,
-    batch_norm,
-    _reshape,
-    _concatenate,
-    _stack,
-    # loss forward functions — single-node VJP-backed ops
-    mse_loss as _mse_loss_fn,
-    mae_loss as _mae_loss_fn,
-    huber_loss as _huber_loss_fn,
-    log_cosh_loss as _log_cosh_loss_fn,
-    bce_loss as _bce_loss_fn,
-    bce_with_logits_loss as _bce_with_logits_loss_fn,
-    cce_loss as _cce_loss_fn,
-    cce_with_logits_loss as _cce_with_logits_loss_fn,
-    sparse_cce_with_logits_loss as _sparse_cce_with_logits_loss_fn,
-    nll_loss as _nll_loss_fn,
-    kl_divergence_loss as _kl_divergence_loss_fn,
-    focal_loss as _focal_loss_fn,
-    hinge_loss as _hinge_loss_fn,
-    squared_hinge_loss as _squared_hinge_loss_fn,
-    cosine_embedding_loss as _cosine_embedding_loss_fn,
-    triplet_margin_loss as _triplet_margin_loss_fn,
-    dice_loss as _dice_loss_fn,
-    tversky_loss as _tversky_loss_fn,
-    wasserstein_loss as _wasserstein_loss_fn,
-    ssim_loss as _ssim_loss_fn,
-)
+import dnp.core.vjp_rules as rules
+
+# VJP registry (func → vjp_fn), populated by @vjp_rule in vjp_rules.py.
+# Imported here for auto-generation and for callers that need direct access.
+VJP_RULES = rules.VJP_RULES
+
+
+# ===========================================================================
+# Device-stats tracker
+# ===========================================================================
+
+
+class _DeviceStats:
+    """Records how many forward-pass operations ran on each device."""
+
+    def __init__(self):
+        self.counts: dict = {"cpu": 0, "cuda": 0}
+
+    def record(self, device: str) -> None:
+        self.counts[device] = self.counts.get(device, 0) + 1
+
+    def reset(self) -> None:
+        self.counts = {"cpu": 0, "cuda": 0}
+
+    def total(self) -> int:
+        return self.counts.get("cpu", 0) + self.counts.get("cuda", 0)
+
+    def percentage(self, device: str) -> float:
+        """Return the percentage of operations that ran on *device* in [0, 100]."""
+        total = self.total()
+        if total == 0:
+            return 0.0
+        return 100.0 * self.counts.get(device, 0) / total
+
+
+#: Module-level singleton used by all ``Ops`` instances.
+device_stats = _DeviceStats()
+
+
+def _unwrap(v):
+    """Extract the raw array data from a Tensor; leave other types untouched."""
+    return v.data if isinstance(v, Tensor) else v
+
+
+# ===========================================================================
+# 2. Ops base class
+# ===========================================================================
 
 
 class Ops:
-    """Bundles a forward function into a graph-compatible callable.
+    """Bundles a forward function and its bound VJP into a graph-compatible callable.
 
-    v3: every call automatically promotes raw arrays / scalars to ``Tensor``
-    via the ``graph_fn`` decorator, so users can write:
-
-        import numpy as np
-        x = np.array([1.0, 2.0, 3.0])
-        y = ops.sin(x)   # x is converted to Tensor, y is a Tensor
+    Parameters
+    ----------
+    func : callable
+        The raw forward function (operates on plain arrays, not Tensors).
+    vjp_fn : callable, optional
+        ``vjp_fn(grad, *fwd_args, **fwd_kwargs) -> tuple[grads]``.
+        Bound once at construction — never fetched from ``VJP_RULES`` at
+        call time.  Falls back to ``VJP_RULES.get(func)`` at init if omitted,
+        so existing code that only passes ``func`` continues to work.
+    name : str, optional
+        Display name; defaults to ``func.__name__``.
+    kernel_call : callable, optional
+        ``kernel_call(op, *args, **kwargs) -> Tensor``
+        Full replacement for ``_raw_call`` for ops that need custom graph
+        wiring.  Receives the ``Ops`` instance as first arg so it can set
+        ``op_func=op`` on the output Tensor node.
     """
 
-    def __init__(self, func, name=None):
+    def __init__(self, func, vjp_fn=None, name=None, kernel_call=None):
         self.func = func
         self.name = name or getattr(func, "__name__", repr(func))
-        # Build the graph-fn-wrapped inner call once at construction time.
-        self._graph_call = graph_fn(self._raw_call)
-
-    def _raw_call(self, *args, **kwargs):
-        """Inner call that expects Tensor arguments (graph_fn handles promotion)."""
-        from .tensor import Tensor
-        from .backend import get_xp
-
-        # Extract raw data
-        args_data = [a.data if isinstance(a, Tensor) else a for a in args]
-        kwargs_data = {
-            k: (v.data if isinstance(v, Tensor) else v) for k, v in kwargs.items()
-        }
-
-        # Explicitly dispatch to the correct backend module.
-        # self.func stays as np.* so VJP_RULES lookup keys are never invalidated.
-        # Fallback to self.func (protocol dispatch) when no named match is found.
-        first_arr = next(
-            (a for a in args_data if hasattr(a, "shape")),
-            next((v for v in kwargs_data.values() if hasattr(v, "shape")), None),
-        )
-        if first_arr is not None:
-            xp = get_xp(first_arr)
-            if xp is not np:
-                func_name = getattr(self.func, "__name__", None)
-                xp_func = getattr(xp, func_name, None) if func_name else None
-                _call = xp_func if xp_func is not None else self.func
-            else:
-                _call = self.func
+        # Bind the VJP once — look up from the registry only as a fallback.
+        self._vjp = vjp_fn if vjp_fn is not None else VJP_RULES.get(func)
+        # Use the provided kernel call or the default graph-wiring path.
+        if kernel_call is not None:
+            raw = lambda *a, **kw: kernel_call(self, *a, **kw)  # noqa: E731
         else:
-            _call = self.func
+            raw = self._raw_call
+        self._graph_call = graph_fn(raw)
 
-        out_data = _call(*args_data, **kwargs_data)
+    # ------------------------------------------------------------------
+    def _raw_call(self, *args, **kwargs):
+        """Default graph-wiring: strip .data -> forward -> build Tensor node."""
+        args_data = [_unwrap(a) for a in args]
+        kwargs_data = {k: _unwrap(v) for k, v in kwargs.items()}
 
-        # Collect Tensor parents (positional only; kwargs Tensors are rare and
-        # handled separately via op_kwargs).
+        out_data = self.func(*args_data, **kwargs_data)
+
         parent_indices = [i for i, a in enumerate(args) if isinstance(a, Tensor)]
         parents = [args[i] for i in parent_indices]
-        parents.extend([v for v in kwargs.values() if isinstance(v, Tensor)])
-
+        parents.extend(v for v in kwargs.values() if isinstance(v, Tensor))
         op_kwargs = {k: v for k, v in kwargs.items() if not isinstance(v, Tensor)}
 
-        # When there are non-Tensor positional args mixed with Tensor args (e.g.
-        # subtract(1.0, tensor)), the backward pass needs the full args list to
-        # call the VJP rule correctly and to map gradients to the right parents.
+        # Mixed-arg path: store full arg list so the VJP can reconstruct it.
         if len(parent_indices) < len(args):
             op_kwargs["_vjp_args"] = args_data
             op_kwargs["_vjp_parent_indices"] = parent_indices
@@ -138,582 +144,337 @@ class Ops:
         return Tensor(
             out_data,
             parents=parents,
-            op_func=self,  # store the Ops instance — backward dispatches via self.vpj()
+            op_func=self,
             op_kwargs=op_kwargs,
             name=self.name,
         )
 
-    def vpj(self, grad, *args, **op_kwargs):
-        """Compute and return the VJP tuple for this op.
-
-        This is the authoritative VJP dispatch point for every ``Ops``
-        instance.  ``Tensor.backward()`` calls ``op.vpj(...)`` directly
-        so the rule lookup always goes through here — never bypassing the
-        ``Ops`` object by hitting ``VJP_RULES`` directly.
-
-        Handles the ``_vjp_args`` / ``_vjp_parent_indices`` keys that
-        ``_raw_call`` inserts when positional args are a mix of scalars
-        and Tensors (e.g. ``1.0 - tensor``).
-        """
-        from .backend import get_xp as _get_xp
-
+    # ------------------------------------------------------------------
+    def vjp(self, grad, *args, **op_kwargs):
+        """Call the VJP bound at init.  Never routes through VJP_RULES."""
+        if self._vjp is None:
+            raise KeyError(f"No VJP rule for '{self.name}'")
         if "_vjp_args" in op_kwargs:
-            # Reconstruct the full positional arg list; wrap plain scalars as
-            # 0-d arrays on the same device as grad so VJP lambdas that call
-            # .shape on all args work and get_xp() returns the right backend.
-            _xp = _get_xp(grad)
             full_args = [
-                _xp.asarray(a) if isinstance(a, (int, float)) else a
+                backend.asarray(a) if isinstance(a, (int, float)) else a
                 for a in op_kwargs["_vjp_args"]
             ]
-            clean_kwargs = {
+            clean_kw = {
                 k: v
                 for k, v in op_kwargs.items()
                 if k not in ("_vjp_args", "_vjp_parent_indices")
             }
-            rule = VJP_RULES.get(self.func)
-            if rule is None:
-                raise KeyError(f"No VJP rule found for '{self.name}'")
-            return rule(grad, *full_args, **clean_kwargs)
+            return self._vjp(grad, *full_args, **clean_kw)
+        return self._vjp(grad, *args, **op_kwargs)
 
-        rule = VJP_RULES.get(self.func)
-        if rule is None:
-            raise KeyError(f"No VJP rule found for '{self.name}'")
-        return rule(grad, *args, **op_kwargs)
-
+    # ------------------------------------------------------------------
     def __call__(self, *args, **kwargs):
-        return self._graph_call(*args, **kwargs)
+        result = self._graph_call(*args, **kwargs)
+        if isinstance(result, Tensor):
+            _dev = "cuda" if is_cupy_array(result.data) else "cpu"
+        elif hasattr(result, "dtype"):
+            _dev = "cuda" if is_cupy_array(result) else "cpu"
+        else:
+            _dev = backend.device
+        device_stats.record(_dev)
+        return result
 
     def __repr__(self):
         return f"Ops('{self.name}')"
 
 
-# ---------------------------------------------------------------------------
-# Specialised Dropout Op — saves binary mask in op_kwargs for VJP
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 3. Kernel call functions for special ops
+#    Signature: kernel_call(op, *args, **kwargs) -> Tensor | array
+#    These replace _raw_call for ops that need custom graph wiring.
+#    Defined *before* the Ops instances that use them.
+# ===========================================================================
+
+# ---- where_kernel_call ----------------------------------------------------
 
 
-class _DropoutOps(Ops):
-    """Specialised Ops for dropout that saves the binary mask in op_kwargs.
+def where_kernel_call(op, condition, x, y):
+    """where: condition is not differentiable and is kept out of the graph."""
+    # Strip condition from Tensor tracking.
+    if isinstance(condition, Tensor):
+        condition = condition.data
+    # Promote bare arrays to Tensor for uniform parent tracking.
+    if hasattr(x, "shape") and not isinstance(x, Tensor):
+        x = Tensor(x)
+    if hasattr(y, "shape") and not isinstance(y, Tensor):
+        y = Tensor(y)
 
-    During the forward pass the mask is generated here and stored in
-    ``op_kwargs["mask"]`` so the VJP (``VJP_RULES[dropout_func]``) can
-    reuse exactly the same mask instead of dividing uniformly by ``(1-p)``.
+    x_data = _unwrap(x)
+    y_data = _unwrap(y)
+    out_data = backend.where(condition, x_data, y_data)
+
+    parents = [p for p in (x, y) if isinstance(p, Tensor)]
+    if not parents:
+        return out_data
+    return Tensor(
+        out_data,
+        parents=parents,
+        op_func=op,
+        op_kwargs={
+            "condition": condition,
+            "x_is_tensor": isinstance(x, Tensor),
+            "y_is_tensor": isinstance(y, Tensor),
+        },
+        name=op.name,
+    )
+
+
+def _where_vjp(grad, *args, **op_kwargs):
+    """VJP for the where Ops — uses condition/x_is_tensor/y_is_tensor from op_kwargs.
+
+    Parents are only the tracked Tensor arguments (x and/or y); condition is
+    never tracked.  The returned tuple has one entry per parent, in order.
     """
-
-    def _raw_call(self, *args, **kwargs):
-        from .tensor import Tensor
-        from .backend import get_xp
-
-        x = args[0]
-        p = kwargs.get("p", 0.5)
-        training = kwargs.get("training", True)
-
-        x_data = x.data if isinstance(x, Tensor) else x
-
-        if training and p > 0:
-            xp = get_xp(x_data)
-            mask = (xp.random.uniform(size=x_data.shape) >= p).astype(x_data.dtype)
-            out_data = x_data * mask / (1.0 - p)
-        else:
-            mask = None
-            out_data = x_data
-
-        parents = [x] if isinstance(x, Tensor) else []
-        if not parents:
-            return out_data
-
-        return Tensor(
-            out_data,
-            parents=parents,
-            op_func=self.func,
-            op_kwargs={"p": p, "training": training, "mask": mask},
-            name=self.name,
-        )
+    condition = op_kwargs["condition"]
+    zeros = backend.zeros_like(grad)
+    grads = []
+    if op_kwargs.get("x_is_tensor", True):
+        grads.append(backend.where(condition, grad, zeros))
+    if op_kwargs.get("y_is_tensor", True):
+        grads.append(backend.where(condition, zeros, grad))
+    return tuple(grads)
 
 
-# ---------------------------------------------------------------------------
-# Gather Op — W[indices], differentiable w.r.t. W via scatter-add
-# ---------------------------------------------------------------------------
+# ---- gather_kernel_call ---------------------------------------------------
 
 
-def _gather_forward(W, indices):
-    """Forward function for the gather op: ``output = W[indices]``."""
-    return W[indices]
+def gather_kernel_call(op, table, idx):
+    """gather/embedding: integer idx is not differentiable; kept out of the graph."""
+    if isinstance(idx, Tensor):
+        idx = idx.data
+    idx = backend.asarray(idx, dtype=int)
+    table_data = _unwrap(table)
+    out_data = table_data[idx]
+    parents = [table] if isinstance(table, Tensor) else []
+    if not parents:
+        return out_data
+    return Tensor(
+        out_data,
+        parents=parents,
+        op_func=op,
+        op_kwargs={"idx": idx},
+        name=op.name,
+    )
 
 
-class _GatherOps(Ops):
-    """Gather op — ``output = W[indices]``.
-
-    Only *W* is differentiable; *indices* are integer arrays and carry no
-    gradient.  The VJP is a scatter-add::
-
-        dW[indices] += upstream_grad
-
-    ``vpj()`` is overridden here so the backward is fully self-contained
-    without needing a separate entry in the global ``VJP_RULES`` dict.
-    This also means any ``Ops`` subclass can define its own backward by
-    simply overriding ``vpj()``.
-    """
-
-    def _raw_call(self, *args, **kwargs):
-        from .tensor import Tensor
-        from .backend import as_numpy
-
-        W = args[0]
-        # indices may be a raw int array OR a Tensor (graph_fn converts numpy
-        # arrays to Tensor automatically; we unwrap it back to plain ints).
-        raw_idx = args[1] if len(args) > 1 else kwargs.get("indices")
-        if isinstance(raw_idx, Tensor):
-            indices = as_numpy(raw_idx.data).astype(int)
-        else:
-            indices = np.asarray(raw_idx, dtype=int)
-
-        W_data = W.data if isinstance(W, Tensor) else W
-        out_data = W_data[indices]
-
-        parents = [W] if isinstance(W, Tensor) else []
-        if not parents:
-            return out_data
-
-        return Tensor(
-            out_data,
-            parents=parents,
-            op_func=self,  # backward dispatches via self.vpj()
-            op_kwargs={"indices": indices},
-            name=self.name,
-        )
-
-    def vpj(self, grad, W, **op_kwargs):
-        """Scatter-add VJP: dW[indices] += grad."""
-        from .backend import get_xp
-
-        indices = op_kwargs["indices"]
-        xp = get_xp(W)
-        dW = xp.zeros_like(W)
-        xp.add.at(dW, indices, grad)
-        return (dW,)
+# ---- dropout_kernel_call --------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
-# Binary operations
-# ---------------------------------------------------------------------------
-add = Ops(np.add, name="add")
-subtract = Ops(np.subtract, name="subtract")
-multiply = Ops(np.multiply, name="multiply")
-divide = Ops(np.divide, name="divide")
-power = Ops(np.power, name="power")
-maximum = Ops(np.maximum, name="maximum")
-minimum = Ops(np.minimum, name="minimum")
-matmul = Ops(np.matmul, name="matmul")
-dot = Ops(np.dot, name="dot")
-
-# ---------------------------------------------------------------------------
-# Unary operations
-# ---------------------------------------------------------------------------
-negative = Ops(np.negative, name="negative")
-square = Ops(np.square, name="square")
-sqrt = Ops(np.sqrt, name="sqrt")
-exp = Ops(np.exp, name="exp")
-log = Ops(np.log, name="log")
-log1p = Ops(np.log1p, name="log1p")
-expm1 = Ops(np.expm1, name="expm1")
-absolute = Ops(np.abs, name="abs")
-sign = Ops(np.sign, name="sign")
-
-# Trigonometry & Hyperbolic
-sin = Ops(np.sin, name="sin")
-cos = Ops(np.cos, name="cos")
-tan = Ops(np.tan, name="tan")
-sinh = Ops(np.sinh, name="sinh")
-cosh = Ops(np.cosh, name="cosh")
-tanh = Ops(np.tanh, name="tanh")
-
-# Rounding
-floor = Ops(np.floor, name="floor")
-ceil = Ops(np.ceil, name="ceil")
-round = Ops(np.round, name="round")
-
-# ---------------------------------------------------------------------------
-# Reductions
-# ---------------------------------------------------------------------------
-sum = Ops(np.sum, name="sum")
-mean = Ops(np.mean, name="mean")
-prod = Ops(np.prod, name="prod")
-max = Ops(np.max, name="max")
-min = Ops(np.min, name="min")
-
-# ---------------------------------------------------------------------------
-# Shape operations
-# ---------------------------------------------------------------------------
-reshape = Ops(_reshape, name="reshape")
-transpose = Ops(np.transpose, name="transpose")
-expand_dims = Ops(np.expand_dims, name="expand_dims")
-squeeze = Ops(np.squeeze, name="squeeze")
-
-# ---------------------------------------------------------------------------
-# Array manipulation operations
-# ---------------------------------------------------------------------------
-concatenate = Ops(_concatenate, name="concatenate")
-stack = Ops(_stack, name="stack")
-clip = Ops(np.clip, name="clip")
-cumsum = Ops(np.cumsum, name="cumsum")
-flip = Ops(np.flip, name="flip")
-roll = Ops(np.roll, name="roll")
-tile = Ops(np.tile, name="tile")
-repeat = Ops(np.repeat, name="repeat")
+def dropout_kernel_call(op, x, p=0.5, training=True):
+    """dropout: generates and caches the binary mask for the backward pass."""
+    x_data = _unwrap(x)
+    if training and p > 0:
+        mask = (backend.random.uniform(size=x_data.shape) >= p).astype(x_data.dtype)
+        out_data = x_data * mask / (1.0 - p)
+    else:
+        mask = None
+        out_data = x_data
+    parents = [x] if isinstance(x, Tensor) else []
+    if not parents:
+        return out_data
+    return Tensor(
+        out_data,
+        parents=parents,
+        op_func=op,
+        op_kwargs={"p": p, "training": training, "mask": mask},
+        name=op.name,
+    )
 
 
-# ---------------------------------------------------------------------------
-# where — condition is not differentiable; handled by a custom Ops subclass
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 4. Auto-generate Ops for every public function registered in VJP_RULES
+#    Public = name does not start with "_"
+#    vjp_fn is passed explicitly so each Ops instance owns its VJP at init.
+# ===========================================================================
+
+for _fn, _vjp_fn in VJP_RULES.items():
+    _n = getattr(_fn, "__name__", None)
+    if _n and not _n.startswith("_"):
+        globals()[_n] = Ops(_fn, vjp_fn=_vjp_fn, name=_n)
+
+del _fn, _vjp_fn, _n  # clean up loop variables
 
 
-class _WhereOps(Ops):
-    """where(condition, x, y) — condition is excluded from gradient tracking.
+# ===========================================================================
+# 5. Manual wrappers for private-named helpers
+#    These are public ops but their forward fn has a leading underscore.
+# ===========================================================================
 
-    ``graph_fn`` would normally convert a boolean ndarray condition into a
-    Tensor (with float dtype), breaking the mask.  This subclass bypasses
-    that conversion and only adds *x* and *y* as differentiable parents.
-    """
-
-    def __call__(self, condition, x, y):
-        """Wrap only x and y; keep condition as a raw array."""
-        from .tensor import Tensor
-
-        # Strip Tensor wrappers from condition so it stays as a bool array.
-        if isinstance(condition, Tensor):
-            condition = condition.data
-
-        # Promote x / y from ndarray → Tensor if needed.
-        if hasattr(x, "shape") and not isinstance(x, Tensor):
-            x = Tensor(x)
-        if hasattr(y, "shape") and not isinstance(y, Tensor):
-            y = Tensor(y)
-
-        return self._raw_call(condition, x, y)
-
-    def _raw_call(self, condition, x, y):
-        from .tensor import Tensor
-        from .backend import get_xp
-
-        x_data = x.data if isinstance(x, Tensor) else x
-        y_data = y.data if isinstance(y, Tensor) else y
-        xp = get_xp(x_data) if hasattr(x_data, "shape") else np
-        out_data = xp.where(condition, x_data, y_data)
-
-        parents = [p for p in (x, y) if isinstance(p, Tensor)]
-        if not parents:
-            return out_data
-
-        return Tensor(
-            out_data,
-            parents=parents,
-            op_func=self,
-            op_kwargs={
-                "condition": condition,
-                "x_is_tensor": isinstance(x, Tensor),
-                "y_is_tensor": isinstance(y, Tensor),
-            },
-            name=self.name,
-        )
-
-    def vpj(self, grad, *args, **op_kwargs):
-        from .backend import get_xp
-
-        xp = get_xp(grad)
-        condition = op_kwargs["condition"]
-        zeros = xp.zeros_like(grad)
-        grads = []
-        if op_kwargs.get("x_is_tensor", True):
-            grads.append(xp.where(condition, grad, zeros))
-        if op_kwargs.get("y_is_tensor", True):
-            grads.append(xp.where(condition, zeros, grad))
-        return tuple(grads)
+reshape     = Ops(rules._reshape,     vjp_fn=VJP_RULES[rules._reshape],     name="reshape")
+concatenate = Ops(rules._concatenate, vjp_fn=VJP_RULES[rules._concatenate], name="concatenate")
+stack       = Ops(rules._stack,       vjp_fn=VJP_RULES[rules._stack],       name="stack")
 
 
-where = _WhereOps(np.where, name="where")
+# ===========================================================================
+# 6. Special-case ops with kernel calls
+#    Explicit construction replaces the auto-gen defaults for ops that need
+#    custom graph wiring.  Order: check VJP registration in vjp_rules.py,
+#    then define kernel_call above (Section 3), then build the Ops here.
+# ===========================================================================
 
-# ---------------------------------------------------------------------------
-# Neural-network & custom ops
-# ---------------------------------------------------------------------------
-conv2d = Ops(conv2d, name="conv2d")
-sigmoid = Ops(sigmoid, name="sigmoid")
-relu = Ops(relu, name="relu")
-leaky_relu = Ops(leaky_relu, name="leaky_relu")
-elu = Ops(elu, name="elu")
-softplus = Ops(softplus, name="softplus")
-swish = Ops(swish, name="swish")
-gelu = Ops(gelu, name="gelu")
-softmax = Ops(softmax, name="softmax")
-
-# Pooling operations (vectorized)
-max_pool2d = Ops(max_pool2d, name="max_pool2d")
-avg_pool2d = Ops(avg_pool2d, name="avg_pool2d")
-
-# Regularization operations — use _DropoutOps to capture the mask
-dropout = _DropoutOps(dropout, name="dropout")
-
-# Normalization operations
-batch_norm = Ops(batch_norm, name="batch_norm")
-
-# Embedding gather — differentiable index lookup (scatter-add VJP)
-gather = _GatherOps(_gather_forward, name="gather")
-
-
-# ---------------------------------------------------------------------------
-# Loss functions — single graph node + direct VJP (no intermediate ops tree)
-# ---------------------------------------------------------------------------
-mse_loss = Ops(_mse_loss_fn, name="mse_loss")
-mae_loss = Ops(_mae_loss_fn, name="mae_loss")
-huber_loss = Ops(_huber_loss_fn, name="huber_loss")
-log_cosh_loss = Ops(_log_cosh_loss_fn, name="log_cosh_loss")
-bce_loss = Ops(_bce_loss_fn, name="bce_loss")
-bce_with_logits_loss = Ops(_bce_with_logits_loss_fn, name="bce_with_logits_loss")
-cce_loss = Ops(_cce_loss_fn, name="cce_loss")
-cce_with_logits_loss = Ops(_cce_with_logits_loss_fn, name="cce_with_logits_loss")
-sparse_cce_with_logits_loss = Ops(
-    _sparse_cce_with_logits_loss_fn, name="sparse_cce_with_logits_loss"
+where = Ops(
+    backend.where,
+    vjp_fn=_where_vjp,            # ops-layer VJP — uses stored condition/flags
+    name="where",
+    kernel_call=where_kernel_call,
 )
-nll_loss = Ops(_nll_loss_fn, name="nll_loss")
-kl_divergence_loss = Ops(_kl_divergence_loss_fn, name="kl_divergence_loss")
-focal_loss = Ops(_focal_loss_fn, name="focal_loss")
-hinge_loss = Ops(_hinge_loss_fn, name="hinge_loss")
-squared_hinge_loss = Ops(_squared_hinge_loss_fn, name="squared_hinge_loss")
-cosine_embedding_loss = Ops(_cosine_embedding_loss_fn, name="cosine_embedding_loss")
-triplet_margin_loss = Ops(_triplet_margin_loss_fn, name="triplet_margin_loss")
-dice_loss = Ops(_dice_loss_fn, name="dice_loss")
-tversky_loss = Ops(_tversky_loss_fn, name="tversky_loss")
-wasserstein_loss = Ops(_wasserstein_loss_fn, name="wasserstein_loss")
-ssim_loss = Ops(_ssim_loss_fn, name="ssim_loss")
+
+gather = Ops(
+    rules.gather,
+    vjp_fn=VJP_RULES[rules.gather],
+    name="gather",
+    kernel_call=gather_kernel_call,
+)
+
+embedding = Ops(
+    rules.embedding,
+    vjp_fn=VJP_RULES[rules.embedding],
+    name="embedding",
+    kernel_call=gather_kernel_call,
+)
+
+embedding_lookup = Ops(
+    rules.embedding_lookup,
+    vjp_fn=VJP_RULES[rules.embedding_lookup],
+    name="embedding_lookup",
+    kernel_call=gather_kernel_call,
+)
+
+dropout = Ops(
+    rules.dropout,
+    vjp_fn=VJP_RULES[rules.dropout],
+    name="dropout",
+    kernel_call=dropout_kernel_call,
+)
 
 
-# ---------------------------------------------------------------------------
-# Array creation helpers — return Tensors so they are graph-compatible
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 7. Array-creation helpers — return leaf Tensors
+# ===========================================================================
 
-
-def _tensor_creation(np_func, name):
-    """Factory: wrap a numpy array-creation function to return a leaf Tensor.
-
-    Uses the active backend (CuPy when available) so creation ops stay on the
-    same device as the rest of the computation graph.
-    """
-    from .backend import backend as _backend
-
-    _func_name = np_func.__name__
-
+def _tensor_creation(func_name, name):
+    """Factory: call backend.<func_name> and return a leaf Tensor."""
+    @graph_fn
     def creator(*args, **kwargs):
-        from .tensor import Tensor
-
-        xp_func = getattr(_backend, _func_name, np_func)
-        data = xp_func(*args, **kwargs)
-        return Tensor(data, name=name)
-
+        args_data = [_unwrap(a) for a in args]
+        kwargs_data = {k: _unwrap(v) for k, v in kwargs.items()}
+        return Tensor(getattr(backend, func_name)(*args_data, **kwargs_data), name=name)
     creator.__name__ = name
     creator.__qualname__ = name
     return creator
 
-
-arange = _tensor_creation(np.arange, "arange")
-linspace = _tensor_creation(np.linspace, "linspace")
-ones = _tensor_creation(np.ones, "ones")
-zeros = _tensor_creation(np.zeros, "zeros")
-full = _tensor_creation(np.full, "full")
-eye = _tensor_creation(np.eye, "eye")
-
-
-def ones_like(x):
-    """Return a Tensor of ones with the same shape/device as *x*."""
-    from .tensor import Tensor
-    from .backend import get_xp
-
-    xp = get_xp(x.data if isinstance(x, Tensor) else x)
-    src = x.data if isinstance(x, Tensor) else x
-    return Tensor(xp.ones_like(src), name="ones_like")
+arange    = _tensor_creation("arange",    "arange")
+linspace  = _tensor_creation("linspace",  "linspace")
+ones      = _tensor_creation("ones",      "ones")
+zeros     = _tensor_creation("zeros",     "zeros")
+full      = _tensor_creation("full",      "full")
+eye       = _tensor_creation("eye",       "eye")
+ones_like = _tensor_creation("ones_like", "ones_like")
+zeros_like= _tensor_creation("zeros_like","zeros_like")
+full_like = _tensor_creation("full_like", "full_like")
 
 
-def zeros_like(x):
-    """Return a Tensor of zeros with the same shape/device as *x*."""
-    from .tensor import Tensor
-    from .backend import get_xp
-
-    xp = get_xp(x.data if isinstance(x, Tensor) else x)
-    src = x.data if isinstance(x, Tensor) else x
-    return Tensor(xp.zeros_like(src), name="zeros_like")
-
-
-def full_like(x, fill_value):
-    """Return a Tensor filled with *fill_value*, same shape/device as *x*."""
-    from .tensor import Tensor
-    from .backend import get_xp
-
-    xp = get_xp(x.data if isinstance(x, Tensor) else x)
-    src = x.data if isinstance(x, Tensor) else x
-    return Tensor(xp.full_like(src, fill_value), name="full_like")
-
-
-# ---------------------------------------------------------------------------
-# Random module — returns Tensor
-# ---------------------------------------------------------------------------
-
+# ===========================================================================
+# 8. _RandomModule — ops.random.*
+# ===========================================================================
 
 class _RandomModule:
-    """Namespace for random array creation that returns Tensors.
-
-    All methods use the active backend so random arrays land on the same
-    device as the rest of the computation graph.
-    """
+    """Backend-agnostic random Tensor factory (ops.random.randn, etc.)."""
 
     @staticmethod
+    @graph_fn
     def randn(*shape):
-        from .tensor import Tensor
-        from .backend import backend as _backend
-
-        return Tensor(_backend.random.randn(*shape), name="randn")
+        return Tensor(backend.random.randn(*[_unwrap(s) for s in shape]), name="randn")
 
     @staticmethod
+    @graph_fn
     def rand(*shape):
-        from .tensor import Tensor
-        from .backend import backend as _backend
-
-        return Tensor(_backend.random.rand(*shape), name="rand")
+        return Tensor(backend.random.rand(*[_unwrap(s) for s in shape]), name="rand")
 
     @staticmethod
+    @graph_fn
     def randint(low, high=None, size=None):
-        from .tensor import Tensor
-        from .backend import backend as _backend, get_dtype
-
         return Tensor(
-            _backend.random.randint(low, high=high, size=size).astype(get_dtype()),
+            backend.random.randint(_unwrap(low), high=_unwrap(high), size=size).astype(get_dtype()),
             name="randint",
         )
 
     @staticmethod
+    @graph_fn
     def uniform(low=0.0, high=1.0, size=None):
-        from .tensor import Tensor
-        from .backend import backend as _backend
-
-        return Tensor(_backend.random.uniform(low, high, size), name="uniform")
+        return Tensor(backend.random.uniform(_unwrap(low), _unwrap(high), size), name="uniform")
 
     @staticmethod
+    @graph_fn
     def normal(loc=0.0, scale=1.0, size=None):
-        from .tensor import Tensor
-        from .backend import backend as _backend
-
-        return Tensor(_backend.random.normal(loc, scale, size), name="normal")
+        return Tensor(backend.random.normal(_unwrap(loc), _unwrap(scale), size), name="normal")
 
     @staticmethod
     def seed(s):
-        np.random.seed(s)
+        backend.random.seed(s)
 
 
 random = _RandomModule()
 
 
+# ===========================================================================
+# 9. __all__
+# ===========================================================================
+
 __all__ = [
     "Ops",
     # binary
-    "add",
-    "subtract",
-    "multiply",
-    "divide",
-    "power",
-    "maximum",
-    "minimum",
-    "matmul",
-    "dot",
+    "add", "subtract", "multiply", "divide", "power",
+    "maximum", "minimum", "matmul", "dot",
     # unary
-    "negative",
-    "square",
-    "sqrt",
-    "exp",
-    "log",
-    "log1p",
-    "expm1",
-    "absolute",
-    "sign",
-    # trig
-    "sin",
-    "cos",
-    "tan",
-    "sinh",
-    "cosh",
-    "tanh",
+    "negative", "square", "sqrt", "exp", "log", "log1p", "expm1",
+    "absolute", "sign",
+    # trig & hyperbolic
+    "sin", "cos", "tan", "sinh", "cosh", "tanh",
     # rounding
-    "floor",
-    "ceil",
-    "round",
+    "floor", "ceil", "round",
     # reductions
-    "sum",
-    "mean",
-    "prod",
-    "max",
-    "min",
+    "sum", "mean", "prod", "max", "min",
     # shape
-    "reshape",
-    "transpose",
-    "expand_dims",
-    "squeeze",
-    # nn
+    "reshape", "transpose", "expand_dims", "squeeze",
+    # array manipulation
+    "concatenate", "stack", "clip", "cumsum", "flip", "roll", "tile", "repeat",
+    "where",
+    # nn activations
+    "sigmoid", "relu", "leaky_relu", "elu", "softplus", "swish", "gelu", "softmax",
+    # conv
     "conv2d",
-    "sigmoid",
-    "relu",
-    "leaky_relu",
-    "elu",
-    "softplus",
-    "swish",
-    "gelu",
-    "softmax",
-    # pooling (vectorized)
-    "max_pool2d",
-    "avg_pool2d",
-    # regularization
-    "dropout",
-    # normalization
-    "batch_norm",
-    # array creation
-    "arange",
-    "linspace",
-    "ones",
-    "zeros",
-    "full",
-    "eye",
-    "ones_like",
-    "zeros_like",
-    "full_like",
+    # pooling
+    "max_pool2d", "avg_pool2d",
+    # regularization / normalization
+    "dropout", "batch_norm",
+    # gather / embedding
+    "gather", "embedding", "embedding_lookup",
+    # recurrent & sequence
+    "rnn_cell", "lstm_cell", "gru_cell", "layer_norm",
+    "scaled_dot_product_attention",
+    # loss functions
+    "mse_loss", "mae_loss", "huber_loss", "log_cosh_loss",
+    "bce_loss", "bce_with_logits_loss",
+    "cce_loss", "cce_with_logits_loss", "sparse_cce_with_logits_loss",
+    "nll_loss", "kl_divergence_loss",
+    "focal_loss", "hinge_loss", "squared_hinge_loss",
+    "cosine_embedding_loss", "triplet_margin_loss",
+    "dice_loss", "tversky_loss", "wasserstein_loss", "ssim_loss",
+    # creation
+    "arange", "linspace", "ones", "zeros", "full", "eye",
+    "ones_like", "zeros_like", "full_like",
     # random
     "random",
-    # array manipulation
-    "concatenate",
-    "stack",
-    "clip",
-    "cumsum",
-    "flip",
-    "roll",
-    "tile",
-    "repeat",
-    "where",
-    "gather",
-    # loss functions (single-node VJP-backed)
-    "mse_loss",
-    "mae_loss",
-    "huber_loss",
-    "log_cosh_loss",
-    "bce_loss",
-    "bce_with_logits_loss",
-    "cce_loss",
-    "cce_with_logits_loss",
-    "sparse_cce_with_logits_loss",
-    "nll_loss",
-    "kl_divergence_loss",
-    "focal_loss",
-    "hinge_loss",
-    "squared_hinge_loss",
-    "cosine_embedding_loss",
-    "triplet_margin_loss",
-    "dice_loss",
-    "tversky_loss",
-    "wasserstein_loss",
-    "ssim_loss",
+    # advanced complex
+    "rope", "flash_attention", "sinkhorn", "neural_ode_solve", "s4_scan",
+    # fourier transforms
+    "fft", "ifft", "fftn", "ifftn",
+    # device tracking
+    "device_stats",
 ]
