@@ -525,8 +525,9 @@ def _copy_weights(model) -> list:
 
 def _restore_weights(model, weights: list) -> None:
     """Overwrite parameter arrays with *weights* (in the same order)."""
+    from ..core.backend import to_device
     for p, w in zip(model.parameters(), weights):
-        p[...] = w
+        p.data[...] = to_device(w, p.device)
 
 
 def _save_model(model, path: str) -> None:
